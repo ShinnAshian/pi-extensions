@@ -195,7 +195,8 @@ describe("codemodeCatalog projection", () => {
 		];
 		const { direct, proxied } = codemodeCatalog(authorized);
 		expect(direct.map((t) => t.name)).toEqual(["codemode"]);
-		expect(direct[0]?.description).toBe("Run scripts.");
+		expect(direct[0]?.description).toContain("Run scripts.");
+		expect(direct[0]?.description).toContain("Nested tools:");
 		expect(direct[0]?.inputSchema).toEqual({ type: "object", properties: { code: { type: "string" } } });
 		expect(proxied.map((t) => t.name)).toEqual(["subagent", "read"]);
 	});

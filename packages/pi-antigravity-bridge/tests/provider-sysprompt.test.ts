@@ -197,7 +197,7 @@ function withEnv(values: Record<string, string | undefined>, fn: () => Promise<v
 
 test("gate: fresh conversation stages the system prompt as an agent, not prompt text", async () => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-gate-agents-"));
-	await withEnv({ AGY_SYSTEM_PROMPT: "on", AGY_AGENT: undefined, AGY_AGENTS_ROOT: root }, async () => {
+	await withEnv({ AGY_SYSTEM_PROMPT: "on", AGY_BRIDGE_TOOLS: "all", AGY_AGENT: undefined, AGY_AGENTS_ROOT: root }, async () => {
 		resetSyspromptAgentForTests();
 		const h = gateHarness();
 		try {
@@ -274,15 +274,16 @@ test("gate: a user-configured agent wins; the block falls back inline (never clo
 });
 
 test("codemode note rides the gate only when requested", () => {
-	// Default: the plain note, no codemode redirection.
+	// Default: the plain note, no codemode priority replacement.
 	const plain = buildFullPrompt(SYS, "", "hello");
-	assert.equal(plain.includes("codemode configuration"), false);
-	// Codemode configuration: the note redirects the file-tool instruction
-	// into scripts, still inside the delimited block.
-	const cm = buildFullPrompt(SYS, "", "hello", { codemodeOnly: true });
-	assert.ok(cm.includes("codemode configuration"), "the codemode note is present");
-	assert.ok(cm.indexOf("codemode configuration") > cm.indexOf(TOOL_PRIORITY_NOTE), "it follows the tool priority note");
-	assert.ok(cm.indexOf("codemode configuration") < cm.indexOf(SYSTEM_PROMPT_END), "it stays inside the delimited block");
+	assert.equal(plain.includes("[Tool priority (codemode):"), false);
+	// Codemode configuration: cohesive codemode priority note stays inside the delimited block.
+	const cm = buildFullPrompt(SYS, "", "hello", { codemodeOnly: true, codemodePure: true, directTools: ["ask_user_question"] });
+	assert.ok(cm.includes("[Tool priority (codemode):"), "the codemode priority note is present");
+	assert.ok(cm.includes("ALL_TOOLS"), "pure codemode discovery instructions are present");
+	assert.ok(cm.includes("ask_user_question"), "configured direct tools are surfaced");
+	assert.ok(cm.indexOf("[Tool priority (codemode):") > cm.indexOf(SYS), "it follows the system prompt");
+	assert.ok(cm.indexOf("[Tool priority (codemode):") < cm.indexOf(SYSTEM_PROMPT_END), "it stays inside the delimited block");
 	// No system prompt, no note either (same gate as the priority note).
-	assert.equal(buildFullPrompt(undefined, "", "hello", { codemodeOnly: true }).includes("codemode configuration"), false);
+	assert.equal(buildFullPrompt(undefined, "", "hello", { codemodeOnly: true }).includes("[Tool priority (codemode):"), false);
 });

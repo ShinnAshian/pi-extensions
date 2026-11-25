@@ -54,11 +54,11 @@ function stubTTY(value: boolean | undefined, run: () => void): void {
 	}
 }
 
-test("config: defaults select the full bridge surface", () => {
+test("config: defaults select the codemode bridge surface", () => {
 	const p = tmpConfig();
 	try {
 		const c = loadConfig(p);
-		assert.equal(c.bridgeTools, "all");
+		assert.equal(c.bridgeTools, "codemode");
 	} finally {
 		fs.rmSync(path.dirname(p), { recursive: true, force: true });
 	}
@@ -76,16 +76,18 @@ test("config: bridgeTools round-trips through load/save", () => {
 	}
 });
 
-test("config: AGY_BRIDGE_TOOLS accepts codemode", () => {
+test("config: AGY_BRIDGE_TOOLS accepts all and codemode", () => {
 	const p = tmpConfig();
 	try {
+		process.env.AGY_BRIDGE_TOOLS = "all";
+		assert.equal(loadConfig(p).bridgeTools, "all");
 		process.env.AGY_BRIDGE_TOOLS = "codemode";
 		assert.equal(loadConfig(p).bridgeTools, "codemode");
 		process.env.AGY_BRIDGE_TOOLS = "CODEMODE";
 		assert.equal(loadConfig(p).bridgeTools, "codemode");
 		process.env.AGY_BRIDGE_TOOLS = "garbage";
 		const c = loadConfig(p);
-		assert.equal(c.bridgeTools, "all");
+		assert.equal(c.bridgeTools, "codemode");
 		assert.ok((c.parseWarnings ?? []).some((w) => w.includes("bridgeTools")), "junk mode warns");
 	} finally {
 		delete process.env.AGY_BRIDGE_TOOLS;
@@ -110,7 +112,7 @@ test("config: invalid bridgeTools value falls back to the default surface", () =
 	const p = tmpConfig();
 	try {
 		saveConfig({ bridgeTools: "bogus" as never }, p);
-		assert.equal(loadConfig(p).bridgeTools, "all");
+		assert.equal(loadConfig(p).bridgeTools, "codemode");
 	} finally {
 		fs.rmSync(path.dirname(p), { recursive: true, force: true });
 	}
@@ -275,7 +277,7 @@ test("config: non-string enum values fall back instead of throwing (issue #23 re
 			);
 			const c = loadConfig(p);
 			assert.equal(c.defaultThinking, "medium");
-			assert.equal(c.bridgeTools, "all");
+			assert.equal(c.bridgeTools, "codemode");
 			assert.equal(c.approvals.gateMode, "auto");
 			assert.equal(c.approvals.mode, "ask");
 			assert.equal(c.agent, undefined);
