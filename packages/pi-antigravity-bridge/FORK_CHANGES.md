@@ -9,13 +9,15 @@ This repository is a fork of [EstebanForge/pi-extensions](https://github.com/Est
 | `src/accounts.ts` | Added | Multi-account encrypted OS keyring vault, async keyring helpers, multi-log email detection, and quota-exhaustion auto-rotation |
 | `src/image-tool.ts` | Added | Official `agy` CLI `generate_image` tool + `.tempmediaStorage` artifact extraction |
 | `src/codemode-description.ts` | Added | Pi 1.6.0-style inline `Nested tools:` TypeScript declaration generator for bridged `codemode` |
-| `extensions/index.ts` | Modified | Windows `agy.exe` fallback discovery, `/agy accounts` & `/agy image` commands/picker, quota rotation wiring, pure codemode catalog, external compression hooks |
+| `extensions/index.ts` | Modified | Windows `agy.exe` fallback discovery, `/agy accounts`, `/agy` Quota row & `/agy quota` TUI modal, `/agy image` commands/picker, quota rotation wiring, pure codemode catalog, external compression hooks |
+| `src/usage.ts` | Modified | Framed interactive `/agy` quota GUI modal (`showQuotaModal`, `buildQuotaModalBody`), relative reset countdowns, and inline summary (`formatQuotaInlineSummary`) |
 | `src/config.ts` | Modified | New config keys & env vars; default `bridgeTools` flipped from `"all"` to `"codemode"` |
 | `src/bridge-catalog.ts` | Modified | Exposure-aware `codemodeNestedTools`, pure `codemodeCatalog` with `directTools`, inline TS descriptions |
 | `src/provider.ts` | Modified | `buildCodemodePriorityNote`, external compression shrink rotation (`shouldRotateOnTranscriptShrink`), `compress` digest preservation, `onQuotaExhausted` rotation hook |
 | `tests/accounts.test.ts` | Added | Vitest unit tests for account storage, auto-numbering, switching, and quota cooldown rotation |
 | `tests/codemode-description.test.ts` | Added | Vitest unit tests for `buildCodemodeBridgeDescription`, `codemodeNestedTools`, `codemodeCatalog`, `buildCodemodePriorityNote`, and compression rotation/digest |
 | `tests/image-tool.test.ts` | Added | Vitest unit tests for `imageAgentMd`, `selectImageDriverModel`, MIME mapping, path resolution, and prompt formatting |
+| `tests/usage-gui.test.ts` | Added | Portable Vitest unit tests for quota modal rendering, countdown formatting, and inline summaries |
 | `tests/config.test.ts`, `tests/bridge-catalog.test.ts`, `tests/provider-sysprompt.test.ts` | Modified | Updated assertions to match the fork's `"codemode"` default, pure catalog description, and `buildCodemodePriorityNote` output |
 
 ---
@@ -64,6 +66,11 @@ This repository is a fork of [EstebanForge/pi-extensions](https://github.com/Est
 
 ### 5. Windows `agy.exe` Discovery Fallback (`extensions/index.ts`)
 - `resolveAgyBinary()` falls back to `%LOCALAPPDATA%\agy\bin\agy.exe` on Windows when `AGY_BIN` is unset (e.g., shells opened before `agy` was added to `PATH`), setting `AGY_BIN` and prepending its directory to `PATH`.
+
+### 6. Interactive `/agy` Quota GUI (`src/usage.ts`, `extensions/index.ts`)
+- **`Quota` Row in `/agy` Picker**: Displays a compact per-account cached summary via `formatQuotaInlineSummary()` (e.g., `Gemini 74%/86% · Claude/GPT 100% (5m ago)`, or `Enter to check` before the first check) and opens the framed quota overlay on `Enter`.
+- **Framed Quota Overlay (`showQuotaModal`, `buildQuotaModalBody`)**: Uses `@estebanforge/pi-tui-dialogs` `frameDialog` backed by zero-token `agy --print /usage --output-format json`, listing the active account label, update clock, `5h limit` before `Weekly`, color-coded 20-segment bars (`success` >= 50%, `warning` >= 20%, `error` < 20%), relative countdown + reset clock (`formatQuotaResetDetail`), and per-group model descriptions. Supports `r` refresh, `a` switch accounts, `b`/`Backspace` back to `/agy`, and `Esc`/`Enter`/`q` close.
+- **`/agy quota` Integration & Cache Invalidation**: Opens `showQuotaModal` directly in TUI mode (keeping the plain-text `formatAgyQuotaReport` output in headless/non-TUI mode) and automatically clears the per-account session quota cache on account switch, login, or quota-exhaustion auto-rotation.
 
 ---
 

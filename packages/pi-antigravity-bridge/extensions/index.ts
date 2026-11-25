@@ -74,7 +74,14 @@ import { agyVersionVerdict, agyUpdateMessage, checkAgyCliVersion, describeAgyVer
 import { isValidAgyAgentName, listAgyAgents } from "../src/agents.js";
 import { formatSubagentRoster, SubagentRoster } from "../src/subagent-roster.js";
 import { spawn } from "node:child_process";
-import { fetchAgyQuota, formatAgyQuotaReport } from "../src/usage.js";
+import {
+	fetchAgyQuota,
+	formatAgyQuotaReport,
+	formatQuotaInlineSummary,
+	showQuotaModal,
+	type AgyQuotaReport,
+	type QuotaModalAction,
+} from "../src/usage.js";
 import { artifactOpenCommand, listAgyArtifacts } from "../src/artifacts.js";
 import { showArtifactsBrowser } from "../src/artifacts-ui.js";
 import { listAgyTasks, tailAgyTaskLog } from "../src/tasks.js";
@@ -88,6 +95,7 @@ import { registerWebTools } from "../src/web-tools.js";
 import { registerImageTool, runImageAgent } from "../src/image-tool.js";
 import {
 	clearActiveCredential,
+	detectActiveAccountEmail,
 	formatAccountsList,
 	listSavedAccounts,
 	removeSavedAccount,
@@ -748,6 +756,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		]);
 	};
 
+	let cachedQuota: { accountKey: string; report: AgyQuotaReport; fetchedAt: number } | undefined;
+	const clearQuotaCache = () => {
+		cachedQuota = undefined;
+	};
+
 	const handleQuotaRotation = async (
 		notice: QuotaNotice,
 		_sessionKey?: string,
@@ -755,6 +768,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		if (!loadConfig().autoRotateAccounts) return { rotated: false };
 		const rot = await rotateAccountOnQuota({ resetsIn: notice.resetsIn });
 		if (rot.rotated && rot.to) {
+			clearQuotaCache();
 			await recycleDriversForAccountChange(`account-rotate:${rot.to}`);
 			fileLog.log("account-auto-rotated", { from: rot.from ?? null, to: rot.to, email: rot.email ?? null }, "info");
 			const who = rot.email ? `${rot.to} (${rot.email})` : rot.to;
@@ -835,6 +849,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		setActiveUi: (ui) => {
 			activeUi = ui;
 		},
+		getQuotaCache: (accountKey) =>
+			cachedQuota && cachedQuota.accountKey === accountKey
+				? { report: cachedQuota.report, fetchedAt: cachedQuota.fetchedAt }
+				: undefined,
+		setQuotaCache: (accountKey, report, fetchedAt) => {
+			cachedQuota = { accountKey, report, fetchedAt };
+		},
+		clearQuotaCache,
 	});
 
 	// AskAntigravity tool: one-shot delegation to agy (ported from
@@ -1428,6 +1450,9 @@ interface AgyCommandCtx {
 	pendingCompactionHandoff: Set<string>;
 	checkAgySetup: (ctx: { ui: ExtensionUIContext; mode: string }, engine: Engine, explicit?: boolean) => Promise<void>;
 	setActiveUi: (ui: ExtensionUIContext) => void;
+	getQuotaCache: (accountKey: string) => { report: AgyQuotaReport; fetchedAt: number } | undefined;
+	setQuotaCache: (accountKey: string, report: AgyQuotaReport, fetchedAt: number) => void;
+	clearQuotaCache: () => void;
 }
 
 interface PendingConfig {
@@ -1864,6 +1889,14 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 				return;
 			}
 			if (sub === "quota") {
+				if (mode === "tui" && ui) {
+					const action = await openQuotaModal(ui, ctx, false);
+					if (action === "accounts") {
+						const followUp = await pickAccountCommand(ui);
+						if (followUp) await agyHandler(followUp, cmdCtx);
+					}
+					return;
+				}
 				// Quota lives in the CLI's Google identity. A pure-ACP install
 				// without the CLI is a supported shape; say what is missing instead
 				// of rendering a fetch failure.
@@ -1884,6 +1917,7 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 						ui?.notify("quota unavailable: agy did not return a /usage payload (see /agy doctor for binary health).", "warning");
 						return;
 					}
+					ctx.setQuotaCache(activeAccountIdentity().key, report, Date.now());
 					ui?.notify(formatAgyQuotaReport(report), "info");
 				} finally {
 					ui?.setStatus("agy-quota", undefined);
@@ -2089,6 +2123,7 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 					}
 					try {
 						const switched = await switchAccount(targetName);
+						ctx.clearQuotaCache();
 						await Promise.allSettled([
 							ctx.driver.close("recycle", `account-switch:${switched.name}`),
 							ctx.acpDriver.close("recycle", `account-switch:${switched.name}`),
@@ -2123,6 +2158,7 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 					ui?.setStatus("agy-login", `waiting for agy Google login${targetName ? ` (${targetName})` : ""}…`);
 					try {
 						await clearActiveCredential();
+						ctx.clearQuotaCache();
 						const code = await new Promise<number | null>((resolve, reject) => {
 							// agy opens the browser, which shows a code to paste back into
 							// agy's stdin (no loopback callback). Relay it via a pi input dialog.
@@ -2144,6 +2180,7 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 							return;
 						}
 						const saved = await saveCurrentAccount(targetName);
+						ctx.clearQuotaCache();
 						await Promise.allSettled([
 							ctx.driver.close("recycle", `account-login:${saved.name}`),
 							ctx.acpDriver.close("recycle", `account-login:${saved.name}`),
@@ -2247,24 +2284,62 @@ async function pickAccountCommand(ui: ExtensionUIContext): Promise<string | unde
 	return picked === LOGIN ? "accounts login" : "accounts save";
 }
 
+function activeAccountIdentity(): { key: string; label: string } {
+	const saved = listSavedAccounts();
+	const activeSlot = saved.accounts.find((a) => a.name === saved.active);
+	const email = activeSlot?.email ?? detectActiveAccountEmail();
+	const label = activeSlot
+		? (email ? `${activeSlot.name} (${email})` : activeSlot.name)
+		: (email ?? "active agy login");
+	return { key: `${saved.active ?? ""}|${email ?? ""}`, label };
+}
+
+async function openQuotaModal(
+	ui: ExtensionUIContext,
+	ctx: AgyCommandCtx,
+	canGoBack: boolean,
+): Promise<QuotaModalAction> {
+	const acct = activeAccountIdentity();
+	const bin = resolveAgyBinary();
+	return showQuotaModal(ui, {
+		accountLabel: acct.label,
+		initial: ctx.getQuotaCache(acct.key),
+		fetchQuota: isAgyInstalled(bin) ? () => fetchAgyQuota(bin) : undefined,
+		canGoBack,
+		onFetched: (report, fetchedAt) => ctx.setQuotaCache(acct.key, report, fetchedAt),
+	});
+}
+
 /** Returns an "accounts ..." subcommand when the Accounts row was chosen. */
 async function openAgyPicker(ui: ExtensionUIContext, ctx: AgyCommandCtx): Promise<string | undefined> {
-	const config = loadConfig();
-	const pending: PendingConfig = {};
-	const saved = listSavedAccounts();
+	while (true) {
+		const config = loadConfig();
+		const pending: PendingConfig = {};
+		const saved = listSavedAccounts();
+		const acct = activeAccountIdentity();
+		const cached = ctx.getQuotaCache(acct.key);
 
-	const rows: DialogRow[] = [
-		// Value-less action rows: DialogMenu resolves the menu with this id on
-		// Enter (see runEngineModal / pickAccountCommand below); every other row cycles in place.
-		engineSettingsRow(config.engine),
-		{
-			id: "accounts",
-			label: "Accounts",
-			description: "Enter: switch, log in, save, or remove Google accounts for agy (closes settings).",
-			currentValue: `${saved.active ?? "none"} (${saved.accounts.length} saved)`,
-		},
-		{
-			id: "auto-rotate",
+		const rows: DialogRow[] = [
+			// Value-less action rows: DialogMenu resolves the menu with this id on
+			// Enter (see runEngineModal / pickAccountCommand / openQuotaModal below);
+			// every other row cycles in place.
+			engineSettingsRow(config.engine),
+			{
+				id: "accounts",
+				label: "Accounts",
+				description: "Enter: switch, log in, save, or remove Google accounts for agy (closes settings).",
+				currentValue: `${saved.active ?? "none"} (${saved.accounts.length} saved)`,
+			},
+			{
+				id: "quota",
+				label: "Quota",
+				description: "Enter: view remaining 5h and weekly quota pools for the active agy account (0 tokens).",
+				currentValue: cached
+					? formatQuotaInlineSummary(cached.report, cached.fetchedAt)
+					: "Enter to check",
+			},
+			{
+				id: "auto-rotate",
 			label: "Auto-rotate accounts",
 			description: "on: when agy reports quota exhaustion, switch to the next saved account that is not cooling down.",
 			currentValue: config.autoRotateAccounts ? "on" : "off",
@@ -2438,60 +2513,67 @@ async function openAgyPicker(ui: ExtensionUIContext, ctx: AgyCommandCtx): Promis
 		{ ...DIALOG_OPTIONS, blocked: dialogBlocked("Antigravity provider") },
 	);
 
-	if (Object.keys(pending).length === 0) {
-		if (resolved === ENGINE_SETTINGS_ROW_ID) await runEngineModal(ui, ctx);
+		if (Object.keys(pending).length > 0) {
+			// The picker cannot switch engines (command-only: /agy engine), but the
+			// mode row can still produce plan while the engine is acp - either the
+			// session-latched engine or the on-disk one, which the Switch engine row
+			// can change mid-session without a restart. Plan cannot be enforced on
+			// provider turns on either engine; refuse the combination.
+			const nextMode = pending.mode ?? config.mode;
+			if (nextMode === "plan" && (ctx.engine === "acp" || config.engine === "acp")) {
+				ui.notify(
+					"plan cannot be enforced on provider turns (google-antigravity/antigravity-cli#1181); provider plan turns are disabled on ACP too. /agy mode accept-edits.",
+					"warning",
+				);
+				return;
+			}
+
+			try {
+				const next = saveConfig(pending);
+				const changed = [
+					pending.mode ? `mode=${next.mode}` : null,
+					pending.readOnly !== undefined ? `readOnly=${next.readOnly ? "on" : "off"}` : null,
+					pending.skipPermissions !== undefined
+						? `permissions=${next.skipPermissions ? "auto-approved" : "prompt"}`
+						: null,
+					pending.askTool !== undefined ? `AskAntigravity tool=${next.askTool ? "on" : "off"}` : null,
+					pending.webTools !== undefined ? `webTools=${next.webTools ? "on" : "off"}` : null,
+					pending.defaultModel !== undefined ? `AskAntigravity model=${next.defaultModel}` : null,
+					pending.defaultThinking !== undefined ? `AskAntigravity thinking=${next.defaultThinking}` : null,
+					pending.bridgeTools !== undefined ? `bridge=${next.bridgeTools}` : null,
+					pending.digest !== undefined ? `digest=${next.digest ? "on" : "off"}` : null,
+					pending.systemPrompt !== undefined ? `system-prompt=${next.systemPrompt ? "on" : "off"}` : null,
+					pending.autoRotateAccounts !== undefined ? `auto-rotate=${next.autoRotateAccounts ? "on" : "off"}` : null,
+					pending.turnTimeoutMin !== undefined ? `turn cap=${next.turnTimeoutMin === 0 ? "off" : `${next.turnTimeoutMin}m`}` : null,
+					pending.acp?.sessionTimeoutMs !== undefined ? `ACP session timeout=${next.acp.sessionTimeoutMs}ms` : null,
+					pending.acp?.sessionRetryOnTimeout !== undefined
+						? `ACP session/new retry=${next.acp.sessionRetryOnTimeout ? "on" : "off"}`
+						: null,
+				]
+					.filter(Boolean)
+					.join(", ");
+				ui.notify(`Saved: ${changed}`, "info");
+			} catch (err) {
+				ui.notify(
+					`Failed to save config: ${err instanceof Error ? err.message : String(err)}`,
+					"error",
+				);
+			}
+		}
+
+		if (resolved === ENGINE_SETTINGS_ROW_ID) {
+			await runEngineModal(ui, ctx);
+			return;
+		}
 		if (resolved === "accounts") return pickAccountCommand(ui);
+		if (resolved === "quota") {
+			const action = await openQuotaModal(ui, ctx, true);
+			if (action === "back") continue;
+			if (action === "accounts") return pickAccountCommand(ui);
+			return;
+		}
 		return;
 	}
-
-	// The picker cannot switch engines (command-only: /agy engine), but the
-	// mode row can still produce plan while the engine is acp - either the
-	// session-latched engine or the on-disk one, which the Switch engine row
-	// can change mid-session without a restart. Plan cannot be enforced on
-	// provider turns on either engine; refuse the combination.
-	const nextMode = pending.mode ?? config.mode;
-	if (nextMode === "plan" && (ctx.engine === "acp" || config.engine === "acp")) {
-		ui.notify(
-			"plan cannot be enforced on provider turns (google-antigravity/antigravity-cli#1181); provider plan turns are disabled on ACP too. /agy mode accept-edits.",
-			"warning",
-		);
-		return;
-	}
-
-	try {
-		const next = saveConfig(pending);
-		const changed = [
-			pending.mode ? `mode=${next.mode}` : null,
-			pending.readOnly !== undefined ? `readOnly=${next.readOnly ? "on" : "off"}` : null,
-			pending.skipPermissions !== undefined
-				? `permissions=${next.skipPermissions ? "auto-approved" : "prompt"}`
-				: null,
-			pending.askTool !== undefined ? `AskAntigravity tool=${next.askTool ? "on" : "off"}` : null,
-			pending.webTools !== undefined ? `webTools=${next.webTools ? "on" : "off"}` : null,
-			pending.defaultModel !== undefined ? `AskAntigravity model=${next.defaultModel}` : null,
-			pending.defaultThinking !== undefined ? `AskAntigravity thinking=${next.defaultThinking}` : null,
-			pending.bridgeTools !== undefined ? `bridge=${next.bridgeTools}` : null,
-			pending.digest !== undefined ? `digest=${next.digest ? "on" : "off"}` : null,
-			pending.systemPrompt !== undefined ? `system-prompt=${next.systemPrompt ? "on" : "off"}` : null,
-			pending.autoRotateAccounts !== undefined ? `auto-rotate=${next.autoRotateAccounts ? "on" : "off"}` : null,
-			pending.turnTimeoutMin !== undefined ? `turn cap=${next.turnTimeoutMin === 0 ? "off" : `${next.turnTimeoutMin}m`}` : null,
-			pending.acp?.sessionTimeoutMs !== undefined ? `ACP session timeout=${next.acp.sessionTimeoutMs}ms` : null,
-			pending.acp?.sessionRetryOnTimeout !== undefined
-				? `ACP session/new retry=${next.acp.sessionRetryOnTimeout ? "on" : "off"}`
-				: null,
-		]
-			.filter(Boolean)
-			.join(", ");
-		ui.notify(`Saved: ${changed}`, "info");
-	} catch (err) {
-		ui.notify(
-			`Failed to save config: ${err instanceof Error ? err.message : String(err)}`,
-			"error",
-		);
-	}
-
-	if (resolved === ENGINE_SETTINGS_ROW_ID) await runEngineModal(ui, ctx);
-	if (resolved === "accounts") return pickAccountCommand(ui);
 }
 
 /** The engine-pick modal shared by /agy engine (no args) and the settings

@@ -1,6 +1,6 @@
 # pi-extensions
 
-> **Fork notice:** This is a fork of [EstebanForge/pi-extensions](https://github.com/EstebanForge/pi-extensions) with enhancements to [`packages/pi-antigravity-bridge`](packages/pi-antigravity-bridge) (multi-account keyring rotation, official-CLI `generate_image` tool, Pi 1.6.0 pure `codemode` declarations, external compression sync, and Windows `agy.exe` discovery). See [`FORK_CHANGES.md`](packages/pi-antigravity-bridge/FORK_CHANGES.md) for the complete changelog and installation instructions.
+> **Fork notice:** This is a fork of [EstebanForge/pi-extensions](https://github.com/EstebanForge/pi-extensions) with enhancements to [`packages/pi-antigravity-bridge`](packages/pi-antigravity-bridge) (multi-account keyring rotation, interactive `/agy` quota GUI, official-CLI `generate_image` tool, Pi 1.6.0 pure `codemode` declarations, external compression sync, and Windows `agy.exe` discovery). See [`FORK_CHANGES.md`](packages/pi-antigravity-bridge/FORK_CHANGES.md) for the complete changelog and installation instructions.
 
 Twenty-one [Pi Coding Agent](https://github.com/earendil-works/pi) extensions in one npm workspace. Install only what you need; each package publishes and installs on its own under the `@estebanforge` scope.
 

@@ -1,6 +1,6 @@
 # pi-antigravity-bridge
 
-> **Fork notice:** This fork extends upstream `@estebanforge/pi-antigravity-bridge@1.15.1` with multi-account management & quota auto-rotation, an official-CLI `generate_image` tool, Pi 1.6.0 pure `codemode` inline declarations, external context-compression sync, and Windows `agy.exe` discovery. See [FORK_CHANGES.md](FORK_CHANGES.md) for full details.
+> **Fork notice:** This fork extends upstream `@estebanforge/pi-antigravity-bridge@1.15.1` with multi-account management & quota auto-rotation, an interactive `/agy` quota GUI, an official-CLI `generate_image` tool, Pi 1.6.0 pure `codemode` inline declarations, external context-compression sync, and Windows `agy.exe` discovery. See [FORK_CHANGES.md](FORK_CHANGES.md) for full details.
 
 A Gemini model provider **and** the `AskAntigravity` delegation tool for [pi](https://github.com/earendil-works/pi), built on the official `agy` CLI: **`agy acp`** by default, with the stream-json CLI engine kept as the fallback. It registers `antigravity/gemini-*` models in pi's `/model` picker (streaming), and provides the `AskAntigravity` tool for one-shot delegation - the same combined shape as `pi-claude-bridge`.
 
