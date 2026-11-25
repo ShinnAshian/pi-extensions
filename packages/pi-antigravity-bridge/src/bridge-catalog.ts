@@ -1,3 +1,4 @@
+import { buildCodemodeBridgeDescription } from "./codemode-description.js";
 import type { BridgeTools } from "./config.js";
 import { POLL_TOOL_NAME } from "./provider.js";
 import { ACTIVATE_SKILL_TOOL_NAME } from "./skills.js";
@@ -6,6 +7,10 @@ export interface BridgeToolInfo {
 	name: string;
 	description?: string;
 	parameters?: object;
+	outputSchema?: unknown;
+	promptGuidelines?: string[];
+	exposure?: "direct" | "codemode" | "deferred" | "model-only" | "hidden" | string;
+	namespace?: { name: string; description?: string };
 	sourceInfo?: { source?: string };
 }
 
@@ -44,20 +49,24 @@ export function serializeToolSchema(parameters?: object): object {
  * the CURRENT Pi active set: /mcp and pi.setActiveTools() can change it mid-session.
  * A stale tools/call must not bypass a disabled Pi tool. */
 export function bridgedPiTools(
-	all: BridgeToolInfo[], active: readonly string[], mode: BridgeTools, hidden: ReadonlySet<string>,
+	all: BridgeToolInfo[],
+	active: readonly string[],
+	mode: BridgeTools,
+	hidden: ReadonlySet<string>,
+	extraCodemodeDirect: readonly string[] = [],
 ): BridgeToolInfo[] {
 	if (mode === "none") return [];
 	const enabled = new Set(active);
+	const directBuiltins = new Set(extraCodemodeDirect);
 	return all.filter((tool) =>
 		enabled.has(tool.name) && !hidden.has(tool.name) &&
 		// Never bridge the bridge's own tools. agy has native web tools, so
 		// our quota-burning one-shot wrappers must not tempt it through MCP.
 		!BRIDGE_INTERNAL_TOOLS.has(tool.name) &&
 		(mode === "codemode"
-			// Codemode mode: pi's builtin codemode tool is the one builtin that
-			// bridges (scripts reach the rest pi-side); the info/call pair covers
-			// tools the engine should not call directly.
-			? tool.name === "codemode" || tool.sourceInfo?.source !== "builtin"
+			// Codemode mode: pi's builtin codemode tool + configured direct builtins
+			// (e.g. ask_user_question) bridge directly; scripts reach all other tools pi-side.
+			? tool.name === "codemode" || directBuiltins.has(tool.name) || tool.sourceInfo?.source !== "builtin"
 			: mode === "mcp"
 				? /pi-mcp-adapter/.test(tool.sourceInfo?.source ?? "")
 				: tool.sourceInfo?.source !== "builtin"),
@@ -75,19 +84,73 @@ export function partitionBridgeTools<T extends BridgeToolInfo>(tools: readonly T
 	return { direct, proxied };
 }
 
-/** Codemode-only catalog projection: pi's codemode tool is the one direct
- *  tool (its own description teaches the script grammar and pi executes the
- *  scripts with pi's tools injected), every other authorized tool rides the
- *  info/call pair so the engine never sees a wide direct catalog. */
+/** Pi tools eligible for `codemode`'s inline `Nested tools:` catalog.
+ *  Mirrors Pi 1.6.0's `_getCallableTools()` + `createCodemodeDescription()`:
+ *  - excludes bridge internals, session-hidden, `hidden`, and `model-only` tools
+ *  - excludes `deferred` tools (callable at runtime via `searchTools` / `ALL_TOOLS`, never listed inline)
+ *  - includes `codemode`-exposed tools unconditionally
+ *  - includes `direct` (or unspecified exposure) tools only when present in `activeToolNames` */
+export function codemodeNestedTools(
+	allTools: readonly BridgeToolInfo[],
+	activeToolNames?: readonly string[],
+	hiddenToolNames: ReadonlySet<string> = new Set(),
+): BridgeToolInfo[] {
+	const active = activeToolNames ? new Set(activeToolNames) : null;
+	return allTools.filter((t) => {
+		if (t.name === "codemode" || BRIDGE_INTERNAL_TOOLS.has(t.name) || hiddenToolNames.has(t.name)) {
+			return false;
+		}
+		const exposure = t.exposure;
+		if (exposure === "deferred" || exposure === "model-only" || exposure === "hidden") return false;
+		if (exposure === "codemode") return true;
+		return active ? active.has(t.name) : true;
+	});
+}
+
+export interface CodemodeCatalogOptions {
+	/** Extra Pi tools exposed directly alongside `codemode` (e.g. `ask_user_question`). */
+	directTools?: readonly string[];
+	/** When true, omit `bridge_tool_info` / `bridge_call_tool` proxies because
+	 *  `codemode` scripts can discover and invoke every tool via `ALL_TOOLS` / `tools.*`. */
+	pure?: boolean;
+	/** Token budget for inline `Nested tools:` TS declarations inside `codemode`. */
+	inlineBudget?: number;
+	/** Full pool of Pi tools callable inside `codemode` scripts (defaults to `authorized`). */
+	nestedTools?: readonly BridgeToolInfo[];
+}
+
+/** Codemode-only catalog projection: pi's `codemode` tool (enriched with inline
+ *  `Nested tools:` TS declarations) plus any configured direct tools (e.g.
+ *  `ask_user_question`). When `pure` is true, `proxied` is empty so redundant
+ *  `bridge_tool_info` / `bridge_call_tool` proxies are omitted. */
 export function codemodeCatalog<T extends BridgeToolInfo>(
 	authorized: readonly T[],
+	opts: CodemodeCatalogOptions = {},
 ): { direct: Array<{ name: string; description: string; inputSchema: object }>; proxied: T[] } {
 	const cm = authorized.find((t) => t.name === "codemode");
-	const proxied = authorized.filter((t) => t.name !== "codemode");
-	const direct = cm
-		? [{ name: cm.name, description: cm.description ?? cm.name, inputSchema: serializeToolSchema(cm.parameters) }]
-		: [];
-	return { direct, proxied };
+	if (!cm) return { direct: [], proxied: opts.pure ? [] : [...authorized] };
+	const directSet = new Set<string>(["codemode", ...(opts.directTools ?? [])]);
+	const nestedSource = opts.nestedTools ?? authorized;
+	const direct: Array<{ name: string; description: string; inputSchema: object }> = [];
+	for (const t of authorized) {
+		if (!directSet.has(t.name)) continue;
+		const description =
+			t.name === "codemode"
+				? buildCodemodeBridgeDescription(t.description ?? t.name, nestedSource, {
+						inlineBudget: opts.inlineBudget,
+						excludeNames: directSet,
+					})
+				: (t.description ?? t.name);
+		direct.push({
+			name: t.name,
+			description,
+			inputSchema: serializeToolSchema(t.parameters),
+		});
+	}
+	return {
+		direct,
+		proxied: opts.pure ? [] : authorized.filter((t) => !directSet.has(t.name)),
+	};
 }
 
 /** Build the bridge_tool_info MCP tool definition listing proxied extension tool names. */

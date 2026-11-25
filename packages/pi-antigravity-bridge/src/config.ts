@@ -141,6 +141,12 @@ export interface AgyConfig {
 	 *  these exist for NON-Antigravity provider sessions and every call
 	 *  spends Antigravity quota. Takes effect at pi start (or /reload). */
 	webTools: boolean;
+	/** Register the generate_image Pi tool (backed by official agy CLI's native
+	 *  generate_image tool). Default ON. Takes effect at pi start (or /reload). */
+	imageTool: boolean;
+	/** Automatically rotate to the next saved agy account in accounts.json when
+	 *  a quota-exhaustion notice is detected. Default ON. */
+	autoRotateAccounts: boolean;
 	/** Set after the one-time notice about a leftover legacy invokeTool patch
 	 *  on the installed pi. The notice never repeats; /agy patch-cleanup is
 	 *  always available. */
@@ -158,6 +164,24 @@ export interface AgyConfig {
 	 *  "mcp" surface serves an empty catalog on installs without
 	 *  pi-mcp-adapter), "mcp" (pi-mcp-adapter tools + skills bridge only). */
 	bridgeTools: BridgeTools;
+	/** Extra pi tools exposed directly alongside `codemode` when
+	 *  `bridgeTools === "codemode"` (default `["ask_user_question"]`).
+	 *  Env AGY_CODEMODE_DIRECT_TOOLS (comma-separated, "" for none) wins. */
+	codemodeDirectTools: string[];
+	/** When true (default) in `codemode` mode, omit redundant `bridge_tool_info`
+	 *  and `bridge_call_tool` proxies since scripts can discover and call every
+	 *  nested tool directly via `ALL_TOOLS` / `searchTools` / `describeTool`.
+	 *  Env AGY_CODEMODE_PURE wins over the file. */
+	codemodePure: boolean;
+	/** Token budget for inline `Nested tools:` TS declarations inside bridged
+	 *  `codemode` (default 4000, matching Pi's `codemode.inlineBudget`).
+	 *  Env AGY_CODEMODE_INLINE_BUDGET wins over the file. */
+	codemodeInlineBudget: number;
+	/** Auto-rotate the bound agy conversation when an external context manager
+	 *  (e.g. billion-context-pi `compress` or transcript shrink) compresses Pi's
+	 *  history, keeping server-side context aligned with Pi's compacted view.
+	 *  Default true. Env AGY_ROTATE_ON_COMPRESSION wins over the file. */
+	rotateOnContextCompression: boolean;
 	/** Extra pi tool names that get the long (120s) synchronous escalation
 	 *  window, in addition to delegation-shaped names (subagent_run,
 	 *  agent_spawn/agent_wait, *delegate*; issue #6). For custom tools that
@@ -231,7 +255,13 @@ const DEFAULTS: AgyConfig = {
 	defaultThinking: "medium",
 	askTool: true,
 	webTools: false,
-	bridgeTools: "all",
+	imageTool: true,
+	autoRotateAccounts: true,
+	bridgeTools: "codemode",
+	codemodeDirectTools: ["ask_user_question"],
+	codemodePure: true,
+	codemodeInlineBudget: 4000,
+	rotateOnContextCompression: true,
 	digest: true,
 	systemPrompt: true,
 	turnTimeoutMin: 0, // placeholder: the real default is resolved per loadConfig call (defaultTurnTimeoutMin)
@@ -444,6 +474,14 @@ export function loadConfig(configFile: string = configPath()): AgyConfig {
 		? ["1", "true", "on"].includes(process.env.AGY_WEB_TOOLS.toLowerCase())
 		: parseBoolish(file.webTools, "webTools", DEFAULTS.webTools, parseWarnings);
 
+	const imageTool = process.env.AGY_IMAGE_TOOL !== undefined
+		? ["1", "true", "on"].includes(process.env.AGY_IMAGE_TOOL.toLowerCase())
+		: parseBoolish(file.imageTool, "imageTool", DEFAULTS.imageTool, parseWarnings);
+
+	const autoRotateAccounts = process.env.AGY_AUTO_ROTATE_ACCOUNTS !== undefined
+		? ["1", "true", "on"].includes(process.env.AGY_AUTO_ROTATE_ACCOUNTS.toLowerCase())
+		: parseBoolish(file.autoRotateAccounts, "autoRotateAccounts", DEFAULTS.autoRotateAccounts, parseWarnings);
+
 	const bridgeRaw = String(process.env.AGY_BRIDGE_TOOLS ?? file.bridgeTools ?? DEFAULTS.bridgeTools).toLowerCase();
 	const bridgeTools: BridgeTools =
 		bridgeRaw === "none" || bridgeRaw === "all" || bridgeRaw === "mcp" || bridgeRaw === "codemode"
@@ -452,6 +490,37 @@ export function loadConfig(configFile: string = configPath()): AgyConfig {
 				parseWarnings.push(`bridgeTools: ${bridgeRaw} is not all|mcp|codemode|none; using ${DEFAULTS.bridgeTools}`);
 				return DEFAULTS.bridgeTools;
 			})();
+
+	const envDirectTools = process.env.AGY_CODEMODE_DIRECT_TOOLS;
+	const directToolsRaw: unknown = envDirectTools !== undefined ? envDirectTools : file.codemodeDirectTools;
+	const codemodeDirectTools = directToolsRaw === undefined
+		? [...DEFAULTS.codemodeDirectTools]
+		: (typeof directToolsRaw === "string"
+			? directToolsRaw.split(",")
+			: Array.isArray(directToolsRaw) ? directToolsRaw : DEFAULTS.codemodeDirectTools
+		)
+			.filter((s): s is string => typeof s === "string")
+			.map((s) => s.trim())
+			.filter((s) => s.length > 0)
+			.slice(0, 32);
+
+	const envCodemodePure = process.env.AGY_CODEMODE_PURE;
+	const codemodePure = envCodemodePure !== undefined
+		? ["1", "true", "on"].includes(envCodemodePure.toLowerCase())
+		: parseBoolish(file.codemodePure, "codemodePure", DEFAULTS.codemodePure, parseWarnings);
+
+	const rawBudget = process.env.AGY_CODEMODE_INLINE_BUDGET ?? file.codemodeInlineBudget;
+	const parsedBudget = rawBudget === undefined || rawBudget === null || String(rawBudget).trim() === ""
+		? DEFAULTS.codemodeInlineBudget
+		: Number(String(rawBudget).trim());
+	const codemodeInlineBudget = Number.isFinite(parsedBudget) && parsedBudget >= 0 && parsedBudget <= 50_000
+		? Math.floor(parsedBudget)
+		: DEFAULTS.codemodeInlineBudget;
+
+	const envRotateComp = process.env.AGY_ROTATE_ON_COMPRESSION;
+	const rotateOnContextCompression = envRotateComp !== undefined
+		? ["1", "true", "on"].includes(envRotateComp.toLowerCase())
+		: parseBoolish(file.rotateOnContextCompression, "rotateOnContextCompression", DEFAULTS.rotateOnContextCompression, parseWarnings);
 
 	// Extra long-window tool names for the bridge escalation (issue #6).
 	// Comma-separated in the env; junk entries and junk shapes are dropped,
@@ -534,7 +603,13 @@ export function loadConfig(configFile: string = configPath()): AgyConfig {
 		defaultThinking,
 		askTool,
 		webTools,
+		imageTool,
+		autoRotateAccounts,
 		bridgeTools,
+		codemodeDirectTools,
+		codemodePure,
+		codemodeInlineBudget,
+		rotateOnContextCompression,
 		escalateLongTools,
 		digest,
 		systemPrompt,

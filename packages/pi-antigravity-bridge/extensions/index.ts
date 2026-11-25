@@ -85,6 +85,17 @@ import { redactText } from "../src/redact.js";
 import { createDailyLogger, type DailyLogger } from "../src/daily-log.js";
 import { registerAskAntigravityTool, toolModelsFromRaw } from "../src/ask-tool.js";
 import { registerWebTools } from "../src/web-tools.js";
+import { registerImageTool, runImageAgent } from "../src/image-tool.js";
+import {
+	clearActiveCredential,
+	formatAccountsList,
+	listSavedAccounts,
+	removeSavedAccount,
+	rotateAccountOnQuota,
+	saveCurrentAccount,
+	switchAccount,
+} from "../src/accounts.js";
+import type { QuotaNotice } from "../src/quota-notice.js";
 import { bridgeMcpConfigDir, sweepStaleBridgeDirs, TOKEN_HEADER } from "../src/mcp-server.js";
 import {
 	registerBridgeServer,
@@ -118,6 +129,7 @@ import {
 	parseBridgeCallRequest,
 	partitionBridgeTools,
 	codemodeCatalog,
+	codemodeNestedTools,
 	serializeToolSchema,
 } from "../src/bridge-catalog.js";
 import { Type } from "typebox";
@@ -125,7 +137,23 @@ import { patchStatus, restorePatch } from "../src/patch-cleanup.js";
 import { withDialogLock } from "../src/dialog-lock.js";
 
 function resolveAgyBinary(): string {
-	return process.env.AGY_BIN || "agy";
+	if (process.env.AGY_BIN) return process.env.AGY_BIN;
+	// Shells started before agy was installed lack its PATH entry. Fall back to
+	// the standard per-user install dir and expose it to every child spawn.
+	if (process.platform === "win32" && process.env.LOCALAPPDATA) {
+		const dir = path.join(process.env.LOCALAPPDATA, "agy", "bin");
+		const exe = path.join(dir, "agy.exe");
+		if (fs.existsSync(exe)) {
+			const sep = path.delimiter;
+			const cur = process.env.PATH ?? process.env.Path ?? "";
+			if (!cur.toLowerCase().split(sep).includes(dir.toLowerCase())) {
+				process.env.PATH = dir + sep + cur;
+			}
+			process.env.AGY_BIN = exe;
+			return exe;
+		}
+	}
+	return "agy";
 }
 
 export default async function (pi: ExtensionAPI): Promise<void> {
@@ -226,7 +254,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	let realmSession: RealmSession | null = null;
 	// Session-only visibility overrides; never change either application's MCP config.
 	const hiddenBridgeTools = new Set<string>();
-	const getBridgeTools = () => bridgedPiTools(pi.getAllTools(), pi.getActiveTools(), loadConfig().bridgeTools, hiddenBridgeTools);
+	const getBridgeTools = () => {
+		const cfg = loadConfig();
+		return bridgedPiTools(pi.getAllTools(), pi.getActiveTools(), cfg.bridgeTools, hiddenBridgeTools, cfg.codemodeDirectTools);
+	};
 	// Staged gate hooks do not stop agy's own request_permission path, so when
 	// true the ACP driver stops letting skipPermissions auto-allow it.
 	let gateActive = false;
@@ -628,25 +659,60 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	// so the next turn starts a fresh backend conversation and ships the
 	// compaction summary once (even when config.digest is disabled).
 	const pendingCompactionHandoff = new Set<string>();
+	// Session keys that observed a billion-context-pi `compress` tool result
+	// mid-turn; rotated once the turn settles on `agent_end` so the in-flight
+	// turn's `store.set` does not clobber the rotation.
+	const pendingExternalCompression = new Set<string>();
 	pi.on("session_shutdown", () => {
 		backgroundWatchDisposed = true;
 		for (const handle of backgroundWatchers.values()) handle.stop();
 		backgroundWatchers.clear();
 		pendingCompactionHandoff.clear();
+		pendingExternalCompression.clear();
 	});
+	const sessionKeyForCtx = (ctx: { sessionManager?: unknown; cwd: string }): string => {
+		const sm = ctx.sessionManager as { getSessionId?: () => string } | undefined;
+		const sid = sm?.getSessionId?.();
+		return sessionKey(sid ? { sessionId: sid } : undefined, ctx.cwd, engine);
+	};
 	pi.on("session_compact", (_event, ctx) => {
 		try {
-			// Shape-cast as in model_select below: tolerate pi builds whose dts
-			// omits getSessionId.
-			const sm = ctx.sessionManager as { getSessionId?: () => string };
-			const sid = sm.getSessionId?.();
-			const key = sessionKey(sid ? { sessionId: sid } : undefined, ctx.cwd, engine);
+			const key = sessionKeyForCtx(ctx);
 			const rotated = rotateSessionOnCompaction(store, key, pendingCompactionHandoff);
 			if (rotated) {
 				fileLog.log("session-compact-rotate", { key, previousConversation: rotated }, "info");
 			}
 		} catch (err) {
 			fileLog.log("session-compact-rotate-error", { error: err instanceof Error ? err.message : String(err) }, "warn");
+		}
+	});
+	pi.on("tool_result", (event, ctx) => {
+		try {
+			if (!loadConfig().rotateOnContextCompression) return;
+			if (event.isError) return;
+			const isDirectCompress = event.toolName === "compress";
+			const isCodemodeCompress =
+				event.toolName === "codemode" &&
+				Array.isArray(event.content) &&
+				event.content.some((b) => b && typeof b === "object" && "text" in b && typeof b.text === "string" && b.text.includes("▣ ACP |"));
+			if (!isDirectCompress && !isCodemodeCompress) return;
+			const key = sessionKeyForCtx(ctx);
+			pendingExternalCompression.add(key);
+			fileLog.log("bcp-compress-detected", { key, tool: event.toolName }, "info");
+		} catch (err) {
+			fileLog.log("bcp-compress-detect-error", { error: err instanceof Error ? err.message : String(err) }, "warn");
+		}
+	});
+	pi.on("agent_end", (_event, ctx) => {
+		try {
+			const key = sessionKeyForCtx(ctx);
+			if (!pendingExternalCompression.delete(key)) return;
+			const rotated = rotateSessionOnCompaction(store, key, pendingCompactionHandoff);
+			if (rotated) {
+				fileLog.log("bcp-compress-rotate", { key, previousConversation: rotated }, "info");
+			}
+		} catch (err) {
+			fileLog.log("bcp-compress-rotate-error", { error: err instanceof Error ? err.message : String(err) }, "warn");
 		}
 	});
 	// Model-switch handoff toast: entering an unbound antigravity model
@@ -675,6 +741,32 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			fileLog.log("handoff-toast-error", { error: err instanceof Error ? err.message : String(err) }, "warn");
 		}
 	});
+	const recycleDriversForAccountChange = async (cause: string): Promise<void> => {
+		await Promise.allSettled([
+			streamDriver.close("recycle", cause),
+			acpDriver.close("recycle", cause),
+		]);
+	};
+
+	const handleQuotaRotation = async (
+		notice: QuotaNotice,
+		_sessionKey?: string,
+	): Promise<{ rotated: boolean; from?: string; to?: string; email?: string }> => {
+		if (!loadConfig().autoRotateAccounts) return { rotated: false };
+		const rot = await rotateAccountOnQuota({ resetsIn: notice.resetsIn });
+		if (rot.rotated && rot.to) {
+			await recycleDriversForAccountChange(`account-rotate:${rot.to}`);
+			fileLog.log("account-auto-rotated", { from: rot.from ?? null, to: rot.to, email: rot.email ?? null }, "info");
+			const who = rot.email ? `${rot.to} (${rot.email})` : rot.to;
+			activeUi?.notify(`Antigravity quota reached; switched account to ${who}.`, "warning");
+			return { rotated: true, from: rot.from, to: rot.to, email: rot.email };
+		}
+		if (rot.reason === "all-in-cooldown") {
+			fileLog.log("account-rotate-exhausted", { from: rot.from ?? null }, "warn");
+		}
+		return { rotated: false };
+	};
+
 	const streamSimple = createStreamSimple({
 		entries,
 		store,
@@ -689,6 +781,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		pendingCompactionHandoff,
 		hasActiveTool: (name) => pi.getActiveTools().includes(name),
 		engine,
+		onQuotaExhausted: handleQuotaRotation,
 		log: fileLog.log.bind(fileLog),
 	});
 
@@ -757,6 +850,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	// Web tools are opt-in (config.webTools, default off): Antigravity sessions
 	// already have native web tools; these serve NON-Antigravity providers.
 	if (loadConfig().webTools) registerWebTools(pi, { log: fileLog.log.bind(fileLog) });
+	// Official-CLI generate_image tool (default on; backed by agy's native
+	// generate_image tool + .tempmediaStorage artifact extraction).
+	if (loadConfig().imageTool) {
+		registerImageTool(pi, {
+			bin: resolveAgyBinary(),
+			entries,
+			onQuotaRotate: (notice) => handleQuotaRotation(notice),
+			log: fileLog.log.bind(fileLog),
+		});
+	}
 
 	// Display-only wrapper tool: the provider emits mutating agy steps as
 	// toolCalls against it (never re-executed - execute() replays the output
@@ -992,12 +1095,23 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		// pi loads project skill locations only after the project is trusted;
 		// mirror that gate. Global skill dirs are always scanned.
 		const skills: SkillLite[] = scanSkills(ctx.isProjectTrusted() ? { projectDir: process.cwd() } : {});
+		const resolveCodemodeCatalog = (authorized: ReturnType<typeof getBridgeTools>, cfg = loadConfig()) => {
+			if (cfg.bridgeTools !== "codemode") return null;
+			const cat = codemodeCatalog(authorized, {
+				directTools: cfg.codemodeDirectTools,
+				pure: cfg.codemodePure,
+				inlineBudget: cfg.codemodeInlineBudget,
+				nestedTools: codemodeNestedTools(pi.getAllTools(), pi.getActiveTools(), hiddenBridgeTools),
+			});
+			return cat.direct.length > 0 ? cat : null;
+		};
 		const listTools = () => {
 			// /mcp and pi.setActiveTools() update the same live catalog. ACP gets
 			// this endpoint through session/new or session/load; no global config write.
-			const mode = loadConfig().bridgeTools;
+			const cfg = loadConfig();
+			const mode = cfg.bridgeTools;
 			const authorized = getBridgeTools();
-			const codemode = mode === "codemode" ? codemodeCatalog(authorized) : null;
+			const codemode = resolveCodemodeCatalog(authorized, cfg);
 			const { direct, proxied } = partitionBridgeTools(authorized);
 			const directDefs = codemode
 				? codemode.direct
@@ -1057,7 +1171,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				return Promise.resolve(formatPollAnswer(wanted, view));
 			}
 			if (name === TOOL_INFO_TOOL_NAME) {
-				const { proxied } = partitionBridgeTools(getBridgeTools());
+				const authorized = getBridgeTools();
+				const codemode = resolveCodemodeCatalog(authorized);
+				const proxied = codemode ? codemode.proxied : partitionBridgeTools(authorized).proxied;
 				return Promise.resolve(formatBridgeToolInfo(proxied, args.names));
 			}
 			const dispatchPiTool = (targetName: string, targetArgs: Record<string, unknown>) =>
@@ -1326,6 +1442,7 @@ interface PendingConfig {
 	bridgeTools?: BridgeTools;
 	digest?: boolean;
 	systemPrompt?: boolean;
+	autoRotateAccounts?: boolean;
 	acp?: Partial<AcpConfig>;
 }
 
@@ -1346,6 +1463,15 @@ function settingsRows(ctx: AgyCommandCtx): string[] {
 		row("permissions:", perm),
 		row("AskAntigravity tool:", config.askTool ? "on" : "off"),
 		row("Web tools:", config.webTools ? "on" : "off"),
+		row("Image tool:", config.imageTool ? "on" : "off"),
+		row(
+			"Accounts:",
+			(() => {
+				const accs = listSavedAccounts();
+				const active = accs.active ?? "default";
+				return `${active} (${accs.accounts.length} saved, auto-rotate: ${config.autoRotateAccounts ? "on" : "off"})`;
+			})(),
+		),
 		row("AskAntigravity model:", config.defaultModel),
 		row("AskAntigravity thinking:", config.defaultThinking),
 		row("bridge tools:", config.bridgeTools),
@@ -1367,7 +1493,7 @@ function statusText(ctx: AgyCommandCtx): string {
 		`  sessions:      ${ctx.store.size} bound`,
 		`  config:        ${configPath()}`,
 		"",
-		"Subcommands: /agy auth, /agy auth-manual, /agy engine stream-json|acp, /agy mode plan|accept-edits, /agy readonly on|off, /agy permissions on|off, /agy ask on|off, /agy model <alias>, /agy thinking low|medium|high|xhigh, /agy agent <name|off>, /agy subagents, /agy quota, /agy artifacts [open <n|name>], /agy tasks [tail <id>], /agy bridge all|mcp|codemode|none, /agy tools [hide|show <name>|reset], /agy web on|off, /agy digest on|off, /agy system-prompt on|off, /agy timeout <1-1440|off>, /agy patch-cleanup, /agy clear, /agy doctor",
+		"Subcommands: /agy auth, /agy auth-manual, /agy accounts [list|save [name]|use <name>|login [name]|remove <name>|auto on|off], /agy image [on|off|<prompt>], /agy engine stream-json|acp, /agy mode plan|accept-edits, /agy readonly on|off, /agy permissions on|off, /agy ask on|off, /agy model <alias>, /agy thinking low|medium|high|xhigh, /agy agent <name|off>, /agy subagents, /agy quota, /agy artifacts [open <n|name>], /agy tasks [tail <id>], /agy bridge all|mcp|codemode|none, /agy tools [hide|show <name>|reset], /agy web on|off, /agy digest on|off, /agy system-prompt on|off, /agy timeout <1-1440|off>, /agy patch-cleanup, /agy clear, /agy doctor",
 	].join("\n");
 }
 
@@ -1375,8 +1501,8 @@ function statusText(ctx: AgyCommandCtx): string {
 function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 	pi.registerCommand("agy", {
 		description:
-			"Antigravity provider: doctor (health + settings), settings picker, clear sessions. Usage: /agy [doctor|auth|auth-manual|engine stream-json|acp|mode plan|accept-edits|readonly on|off|permissions on|off|ask on|off|model <alias>|thinking low|medium|high|xhigh|agent <name|off>|subagents|quota|artifacts [open <n|name>]|tasks [tail <id>]|bridge all|mcp|codemode|none|tools [hide|show <name>|reset]|web on|off|digest on|off|system-prompt on|off|timeout <1-1440|off>|patch-cleanup|clear]",
-		handler: async (args, cmdCtx: ExtensionCommandContext) => {
+			"Antigravity provider: doctor, accounts, image, settings picker, clear sessions. Usage: /agy [doctor|auth|auth-manual|accounts [list|save|use|login|remove|auto]|image [on|off|<prompt>]|engine stream-json|acp|mode plan|accept-edits|readonly on|off|permissions on|off|ask on|off|model <alias>|thinking low|medium|high|xhigh|agent <name|off>|subagents|quota|artifacts [open <n|name>]|tasks [tail <id>]|bridge all|mcp|codemode|none|tools [hide|show <name>|reset]|web on|off|digest on|off|system-prompt on|off|timeout <1-1440|off>|patch-cleanup|clear]",
+		handler: async function agyHandler(args: string, cmdCtx: ExtensionCommandContext): Promise<void> {
 			const ui = cmdCtx.ui;
 			if (ui) ctx.setActiveUi(ui);
 			const mode = cmdCtx.mode;
@@ -1495,6 +1621,9 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 					"Antigravity doctor (no tokens spent)",
 					`  engine:        ${engine}`,
 					`  bridge:        ${config.bridgeTools}${port ? ` (port ${port})` : " (not running)"}`,
+					...(config.bridgeTools === "codemode"
+						? [`  codemode:      pure=${config.codemodePure} direct=[${config.codemodeDirectTools.join(", ")}] inlineBudget=${config.codemodeInlineBudget} rotateOnCompress=${config.rotateOnContextCompression}`]
+						: []),
 					...(config.bridgeTools === "codemode" && !pi.getActiveTools().includes("codemode")
 						? ["  bridge:        codemode tool INACTIVE in pi; the engine sees an all-mode catalog without the codemode note. Activate with --tools codemode or the defaultTools setting."]
 						: []),
@@ -1886,6 +2015,152 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 				}
 				return;
 			}
+			if (sub === "image") {
+				const rawRest = (args ?? "").trim().replace(/^image\b/i, "").trim();
+				if (!rawRest) {
+					ui?.notify(
+						`Image tool (generate_image): ${loadConfig().imageTool ? "on" : "off"}\nusage: /agy image on|off  OR  /agy image <prompt>`,
+						"info",
+					);
+					return;
+				}
+				if (val === "on" || val === "off") {
+					const next = saveConfig({ imageTool: val === "on" });
+					ui?.notify(
+						next.imageTool
+							? "Image tool on: generate_image registers on the next pi start (or /reload)."
+							: "Image tool off: generate_image will not register on the next pi start (or /reload).",
+						"info",
+					);
+					return;
+				}
+				ui?.setStatus("agy-image", "generating image via agy…");
+				try {
+					const res = await runImageAgent({
+						prompt: rawRest,
+						entries: ctx.entries,
+						bin: resolveAgyBinary(),
+						cwd: cmdCtx.cwd ?? process.cwd(),
+						log: ctx.fileLog.log.bind(ctx.fileLog),
+					});
+					if (!res.ok) {
+						ui?.notify(`Image generation failed: ${res.error}`, "error");
+					} else {
+						ui?.notify(`Image saved to ${res.path} (${res.mimeType}, ${res.bytes} bytes)`, "info");
+					}
+				} finally {
+					ui?.setStatus("agy-image", undefined);
+				}
+				return;
+			}
+			if (sub === "accounts" || sub === "account") {
+				const tokens = (args ?? "").trim().split(/\s+/);
+				const action = (tokens[1] ?? "list").toLowerCase();
+				const targetName = tokens[2];
+				const cfg = loadConfig();
+				if (action === "list") {
+					ui?.notify(formatAccountsList(listSavedAccounts(), cfg.autoRotateAccounts), "info");
+					return;
+				}
+				if (action === "auto") {
+					const toggle = (tokens[2] ?? "").toLowerCase();
+					if (toggle === "on" || toggle === "off") {
+						const next = saveConfig({ autoRotateAccounts: toggle === "on" });
+						ui?.notify(`Auto-rotate accounts on quota exhaustion: ${next.autoRotateAccounts ? "on" : "off"}.`, "info");
+					} else {
+						ui?.notify(`auto-rotate: ${cfg.autoRotateAccounts ? "on" : "off"}\nusage: /agy accounts auto on|off`, "info");
+					}
+					return;
+				}
+				if (action === "save") {
+					try {
+						const saved = await saveCurrentAccount(targetName);
+						const who = saved.email ? ` (${saved.email})` : "";
+						ui?.notify(`Saved active agy login as "${saved.name}"${who} [${saved.encoding}].`, "info");
+					} catch (err) {
+						ui?.notify(`Failed to save account: ${err instanceof Error ? err.message : String(err)}`, "error");
+					}
+					return;
+				}
+				if (action === "use" || action === "switch") {
+					if (!targetName) {
+						ui?.notify("usage: /agy accounts use <name>", "warning");
+						return;
+					}
+					try {
+						const switched = await switchAccount(targetName);
+						await Promise.allSettled([
+							ctx.driver.close("recycle", `account-switch:${switched.name}`),
+							ctx.acpDriver.close("recycle", `account-switch:${switched.name}`),
+						]);
+						ctx.store.clear();
+						ctx.pendingCompactionHandoff.clear();
+						const who = switched.email ? ` (${switched.email})` : "";
+						ui?.notify(`Switched active agy account to "${switched.name}"${who}. Recycled agy driver and cleared session bindings.`, "info");
+					} catch (err) {
+						ui?.notify(`Failed to switch account: ${err instanceof Error ? err.message : String(err)}`, "error");
+					}
+					return;
+				}
+				if (action === "remove" || action === "rm" || action === "delete") {
+					if (!targetName) {
+						ui?.notify("usage: /agy accounts remove <name>", "warning");
+						return;
+					}
+					const removed = removeSavedAccount(targetName);
+					ui?.notify(
+						removed ? `Removed saved account "${targetName}".` : `Account "${targetName}" not found.`,
+						removed ? "info" : "warning",
+					);
+					return;
+				}
+				if (action === "login") {
+					const bin = resolveAgyBinary();
+					if (!isAgyInstalled(bin)) {
+						ui?.notify("agy CLI is not installed. Run /agy auth-manual for install instructions.", "error");
+						return;
+					}
+					ui?.setStatus("agy-login", `waiting for agy Google login${targetName ? ` (${targetName})` : ""}…`);
+					try {
+						await clearActiveCredential();
+						const code = await new Promise<number | null>((resolve, reject) => {
+							// agy opens the browser, which shows a code to paste back into
+							// agy's stdin (no loopback callback). Relay it via a pi input dialog.
+							const child = spawn(bin, ["acp", "--login"], { stdio: ["pipe", "ignore", "ignore"], windowsHide: false });
+							const exited = new AbortController();
+							const timer = setTimeout(() => child.kill(), 5 * 60_000);
+							child.once("error", (e) => { clearTimeout(timer); exited.abort(); reject(e); });
+							child.once("close", (c) => { clearTimeout(timer); exited.abort(); resolve(c); });
+							void ui
+								?.input("Paste the authorization code shown in the browser", "4/0A…", { signal: exited.signal })
+								.then((authCode) => {
+									if (exited.signal.aborted) return;
+									if (authCode?.trim()) child.stdin?.end(`${authCode.trim()}\n`);
+									else child.kill();
+								});
+						});
+						if (code !== 0) {
+							ui?.notify(`agy acp --login exited with code ${code ?? "signal"}. Run 'agy acp --login' in a terminal, then '/agy accounts save${targetName ? ` ${targetName}` : ""}'.`, "warning");
+							return;
+						}
+						const saved = await saveCurrentAccount(targetName);
+						await Promise.allSettled([
+							ctx.driver.close("recycle", `account-login:${saved.name}`),
+							ctx.acpDriver.close("recycle", `account-login:${saved.name}`),
+						]);
+						ctx.store.clear();
+						const who = saved.email ? ` (${saved.email})` : "";
+						ui?.notify(`Logged in and saved account "${saved.name}"${who}.`, "info");
+					} catch (err) {
+						ui?.notify(`Account login failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+					} finally {
+						ui?.setStatus("agy-login", undefined);
+					}
+					return;
+				}
+				ui?.notify("usage: /agy accounts [list|save [name]|use <name>|login [name]|remove <name>|auto on|off]", "warning");
+				return;
+			}
 			if (sub === "digest") {
 				if (val === "on" || val === "off") {
 					const next = saveConfig({ digest: val === "on" });
@@ -1939,7 +2214,9 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 				return;
 			}
 
-			await openAgyPicker(ui, ctx);
+			// The picker's Accounts row hands back an "accounts ..." subcommand.
+			const followUp = await openAgyPicker(ui, ctx);
+			if (followUp) await agyHandler(followUp, cmdCtx);
 		},
 	});
 }
@@ -1948,14 +2225,51 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
  *  (mode, permissions, model, thinking, bridge, digest, system prompt) plus
  *  the engine row, which resolves the menu on Enter and opens the same
  *  picker modal as /agy engine (self-service binary + auth setup for acp). */
-async function openAgyPicker(ui: ExtensionUIContext, ctx: AgyCommandCtx): Promise<void> {
+async function pickAccountCommand(ui: ExtensionUIContext): Promise<string | undefined> {
+	const { active, accounts } = listSavedAccounts();
+	const now = Date.now();
+	const useRows = accounts.map(
+		(a) =>
+			`Use: ${a.name}${a.email ? ` (${a.email})` : ""}${a.name === active ? " ✓ active" : ""}${a.cooldownUntil && a.cooldownUntil > now ? " · cooling down" : ""}`,
+	);
+	const LOGIN = "Login new account (browser)…";
+	const SAVE = "Save current agy login…";
+	const REMOVE = "Remove account…";
+	const picked = await ui.select("Antigravity accounts", [...useRows, LOGIN, SAVE, ...(accounts.length ? [REMOVE] : [])]);
+	if (!picked) return undefined;
+	const idx = useRows.indexOf(picked);
+	if (idx >= 0) return `accounts use ${accounts[idx].name}`;
+	if (picked === REMOVE) {
+		const name = await ui.select("Remove which account?", accounts.map((a) => a.name));
+		if (!name || !(await ui.confirm("Remove account", `Remove saved account "${name}"?`))) return undefined;
+		return `accounts remove ${name}`;
+	}
+	return picked === LOGIN ? "accounts login" : "accounts save";
+}
+
+/** Returns an "accounts ..." subcommand when the Accounts row was chosen. */
+async function openAgyPicker(ui: ExtensionUIContext, ctx: AgyCommandCtx): Promise<string | undefined> {
 	const config = loadConfig();
 	const pending: PendingConfig = {};
+	const saved = listSavedAccounts();
 
 	const rows: DialogRow[] = [
-		// Value-less action row: DialogMenu resolves the menu with this id on
-		// Enter (see runEngineModal below); every other row cycles in place.
+		// Value-less action rows: DialogMenu resolves the menu with this id on
+		// Enter (see runEngineModal / pickAccountCommand below); every other row cycles in place.
 		engineSettingsRow(config.engine),
+		{
+			id: "accounts",
+			label: "Accounts",
+			description: "Enter: switch, log in, save, or remove Google accounts for agy (closes settings).",
+			currentValue: `${saved.active ?? "none"} (${saved.accounts.length} saved)`,
+		},
+		{
+			id: "auto-rotate",
+			label: "Auto-rotate accounts",
+			description: "on: when agy reports quota exhaustion, switch to the next saved account that is not cooling down.",
+			currentValue: config.autoRotateAccounts ? "on" : "off",
+			values: ["off", "on"],
+		},
 		{
 			id: "mode",
 			label: "Execution mode",
@@ -2095,6 +2409,8 @@ async function openAgyPicker(ui: ExtensionUIContext, ctx: AgyCommandCtx): Promis
 							pending.digest = newValue === "on";
 						} else if (id === "system-prompt") {
 							pending.systemPrompt = newValue === "on";
+						} else if (id === "auto-rotate") {
+							pending.autoRotateAccounts = newValue === "on";
 						} else if (id === "acp-session-timeout") {
 							pending.acp = {
 								...pending.acp,
@@ -2124,6 +2440,7 @@ async function openAgyPicker(ui: ExtensionUIContext, ctx: AgyCommandCtx): Promis
 
 	if (Object.keys(pending).length === 0) {
 		if (resolved === ENGINE_SETTINGS_ROW_ID) await runEngineModal(ui, ctx);
+		if (resolved === "accounts") return pickAccountCommand(ui);
 		return;
 	}
 
@@ -2156,6 +2473,7 @@ async function openAgyPicker(ui: ExtensionUIContext, ctx: AgyCommandCtx): Promis
 			pending.bridgeTools !== undefined ? `bridge=${next.bridgeTools}` : null,
 			pending.digest !== undefined ? `digest=${next.digest ? "on" : "off"}` : null,
 			pending.systemPrompt !== undefined ? `system-prompt=${next.systemPrompt ? "on" : "off"}` : null,
+			pending.autoRotateAccounts !== undefined ? `auto-rotate=${next.autoRotateAccounts ? "on" : "off"}` : null,
 			pending.turnTimeoutMin !== undefined ? `turn cap=${next.turnTimeoutMin === 0 ? "off" : `${next.turnTimeoutMin}m`}` : null,
 			pending.acp?.sessionTimeoutMs !== undefined ? `ACP session timeout=${next.acp.sessionTimeoutMs}ms` : null,
 			pending.acp?.sessionRetryOnTimeout !== undefined
@@ -2173,6 +2491,7 @@ async function openAgyPicker(ui: ExtensionUIContext, ctx: AgyCommandCtx): Promis
 	}
 
 	if (resolved === ENGINE_SETTINGS_ROW_ID) await runEngineModal(ui, ctx);
+	if (resolved === "accounts") return pickAccountCommand(ui);
 }
 
 /** The engine-pick modal shared by /agy engine (no args) and the settings

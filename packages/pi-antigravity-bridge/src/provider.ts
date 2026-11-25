@@ -40,8 +40,8 @@ import { clampOverflowUsage, toPiUsage } from "./stream-events.js";
 import { mapAgyToolToNative } from "./native-tools.js";
 import { toAgyEffort, type AgyModelEntry } from "./models.js";
 import { AcpHistorySync, OutboundFrameBudgetError } from "./acp/history-sync.js";
-import { SessionStore } from "./sessions.js";
-import { detectQuotaNotice, quotaErrorMessage } from "./quota-notice.js";
+import { SessionStore, type AgySession } from "./sessions.js";
+import { detectQuotaNotice, quotaErrorMessage, type QuotaNotice } from "./quota-notice.js";
 import { redactText } from "./redact.js";
 import { loadConfig } from "./config.js";
 import { GATE_MARKER, mapNativeToShadow, stripMarkerFields } from "./approval-gate.js";
@@ -264,15 +264,37 @@ export const TOOL_PRIORITY_NOTE =
 export const CODEMODE_NOTE =
 	"This conversation runs in codemode configuration: the direct Pi file tools (read, ls, grep, find, edit, write, bash) are not in your tool list; call them from inside codemode scripts as tools.read, tools.ls, tools.grep, tools.find, tools.edit, tools.write, tools.bash. Long or multi-step file work belongs in one script, not many tool calls.";
 
+export interface FullPromptOptions {
+	codemodeOnly?: boolean;
+	codemodePure?: boolean;
+	directTools?: readonly string[];
+}
+
+/** Cohesive tool-priority instruction for codemode-first sessions: avoids
+ *  telling the model to call non-existent direct file tools or bridge_tool_info
+ *  proxies when running in pure codemode, and prevents drift onto agy native tools. */
+export function buildCodemodePriorityNote(opts?: { pure?: boolean; directTools?: readonly string[] }): string {
+	const extras = (opts?.directTools ?? []).filter((n) => n && n !== "codemode");
+	const directClause = extras.length > 0
+		? `Direct MCP tools available alongside codemode: ${extras.join(", ")}. For interactive user questions always use ask_user_question (never agy's native ask_question, which never reaches the user).`
+		: "Never use agy's native interactive tools (e.g. ask_question), which never reach the user.";
+	const discoveryClause = opts?.pure
+		? "Inspect or discover unlisted/deferred Pi tools inside codemode via ALL_TOOLS, await searchTools(query), and await describeTool(name)."
+		: "Inspect unlisted Pi tools inside codemode via ALL_TOOLS / searchTools / describeTool (or bridge_tool_info / bridge_call_tool).";
+	return `[Tool priority (codemode): this conversation runs inside pi, not as a standalone agy session; the user only sees what surfaces in pi. ${directClause} NEVER use agy native filesystem, shell, search, subagent, artifact, or schedule tools (view_file, read_file, edit_file, write_file, run_command, grep_search, find_by_name, invoke_subagent, run_subagent, manage_subagents, schedule, <artifacts>, /goal): native file tools reject real paths and native subagents/timers are invisible to pi. Run ALL file, shell, codebase-memory, file-search, web-search, delegation, and context-management work inside MCP codemode scripts (await tools.read, tools.bash, tools.edit, tools.write, etc.); batch independent calls with Promise.allSettled and filter bulky outputs inside JS. ${discoveryClause} Image files returned by tools.read or image() inside codemode are visible to you. Long-running bridge calls answer STILL RUNNING with a callId after ~20s; poll bridge_poll_result until the result lands before finishing your turn.]`;
+}
+
 export function buildFullPrompt(
 	systemPrompt: string | undefined,
 	digest: string,
 	prompt: string,
-	options?: { codemodeOnly?: boolean },
+	options?: FullPromptOptions,
 ): string {
 	const parts: string[] = [];
 	if (systemPrompt) {
-		const note = options?.codemodeOnly ? `${TOOL_PRIORITY_NOTE}\n\n${CODEMODE_NOTE}` : TOOL_PRIORITY_NOTE;
+		const note = options?.codemodeOnly
+			? buildCodemodePriorityNote({ pure: options.codemodePure, directTools: options.directTools })
+			: TOOL_PRIORITY_NOTE;
 		parts.push(`${SYSTEM_PROMPT_PREAMBLE}\n\n${systemPrompt}\n\n${note}\n\n${SYSTEM_PROMPT_END}`);
 	}
 	if (digest) {
@@ -321,6 +343,28 @@ function capToolResultBody(t: string): string {
 }
 
 const TOOL_CALL_ARGS_CAP = 200;
+const COMPRESS_SUMMARY_CAP = 6000;
+
+/** Format a billion-context-pi `compress` tool call without losing its summary
+ *  body under TOOL_CALL_ARGS_CAP when seeding a freshly rotated conversation. */
+function renderCompressToolCall(args: unknown): string | null {
+	if (!args || typeof args !== "object") return null;
+	const content = (args as { content?: unknown }).content;
+	if (!Array.isArray(content) || content.length === 0) return null;
+	const blocks: string[] = [];
+	for (const item of content) {
+		if (!item || typeof item !== "object") continue;
+		const entry = item as { topic?: unknown; startId?: unknown; endId?: unknown; summary?: unknown };
+		if (typeof entry.summary !== "string" || !entry.summary.trim()) continue;
+		const range = [entry.startId, entry.endId].filter((v): v is string => typeof v === "string" && v.length > 0).join("-");
+		const topic = typeof entry.topic === "string" && entry.topic.trim() ? `: ${entry.topic.trim()}` : "";
+		const body = entry.summary.length > COMPRESS_SUMMARY_CAP
+			? `${entry.summary.slice(0, COMPRESS_SUMMARY_CAP)}\n[truncated]`
+			: entry.summary;
+		blocks.push(`[compressed history summary${range ? ` (${range}${topic})` : topic ? ` (${topic.slice(2)})` : ""}]\n${redactText(body)}`);
+	}
+	return blocks.length > 0 ? blocks.join("\n\n") : null;
+}
 
 function renderToolCalls(content: unknown): string {
 	if (!Array.isArray(content)) return "";
@@ -328,6 +372,21 @@ function renderToolCalls(content: unknown): string {
 	for (const b of content) {
 		if (typeof b !== "object" || b === null || (b as { type?: string }).type !== "toolCall") continue;
 		const { name, arguments: args } = b as { name?: string; arguments?: unknown };
+		if (name === "compress") {
+			const rendered = renderCompressToolCall(args);
+			if (rendered) {
+				lines.push(rendered);
+				continue;
+			}
+		}
+		if (name === "codemode" && args && typeof args === "object") {
+			const code = (args as { code?: unknown }).code;
+			if (typeof code === "string" && code.includes("tools.compress(")) {
+				const clipped = code.length > COMPRESS_SUMMARY_CAP ? `${code.slice(0, COMPRESS_SUMMARY_CAP)}…` : code;
+				lines.push(`[tool call: codemode (includes compress)]\n${redactText(clipped)}`);
+				continue;
+			}
+		}
 		let argsText: string;
 		try {
 			argsText = JSON.stringify(args ?? {});
@@ -636,6 +695,34 @@ export function rotateSessionOnCompaction(
 	return existing.conversationId;
 }
 
+/** Detect whether an external context manager (e.g. billion-context-pi) or
+ *  transcript branch shrink shortened/rewrote Pi's message history under a
+ *  bound agy conversation. Pure; exported for unit testing. */
+export function shouldRotateOnTranscriptShrink(
+	existing: AgySession | null,
+	messages: readonly Message[],
+): boolean {
+	if (!existing?.conversationId) return false;
+	const prevCount = existing.lastMessageCount ?? 0;
+	if (prevCount <= 0) return false;
+	// Strict message-count shrink: messages were folded/dropped since last turn.
+	if (messages.length < prevCount) return true;
+	// Same-or-larger count after a rewrite: rotate if the stored boundary moved
+	// AND a billion-context-pi compress anchor is present in the transcript.
+	if (
+		existing.digestBoundary !== undefined &&
+		existing.digestBoundary !== boundaryFingerprint(messages[prevCount - 1])
+	) {
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const m = messages[i];
+			if (m.role === "toolResult" && (m.toolName === "compress" || (m.toolName === "codemode" && blocksToText(m.content).includes("▣ ACP |")))) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 /** Track which content block is currently open so we close-on-switch.
  *  At most one of textIdx / thinkingIdx is non-null at a time. */
 export interface BlockState {
@@ -703,6 +790,13 @@ export interface StreamSimpleDeps {
 		mode: Map<string, "digest" | "sync">;
 		rebuildStreak: Map<string, number>;
 	};
+	/** Optional hook invoked when a quota-exhaustion notice is detected.
+	 *  May rotate the active agy keyring account and recycle drivers so Pi's
+	 *  retryable-error handoff retries immediately on the next account. */
+	onQuotaExhausted?: (
+		notice: QuotaNotice,
+		sessionKey: string,
+	) => Promise<{ rotated: boolean; from?: string; to?: string; email?: string }>;
 	/** Daily file log sink (src/daily-log.ts). Records pre-dispatch turn
 	 *  errors that never create a driver turn (and so never reach onTurnEnd). */
 	log?: (event: string, data?: unknown, level?: "debug" | "info" | "warn" | "error") => void;
@@ -1466,6 +1560,7 @@ export interface DriverDeps {
 		mode: Map<string, "digest" | "sync">;
 		rebuildStreak: Map<string, number>;
 	};
+	onQuotaExhausted?: StreamSimpleDeps["onQuotaExhausted"];
 	/** Daily file log sink for pre-dispatch errors (see StreamSimpleDeps). */
 	log?: (event: string, data?: unknown, level?: "debug" | "info" | "warn" | "error") => void;
 }
@@ -1705,8 +1800,8 @@ async function runTurnDriver(
 	// binding, never claim dead/stranded tool results, and never arm
 	// background watchers for throwaway turns.
 	const ephemeral = options?.cacheRetention === "none" || options?.disableContinuation === true;
-	const existing = ephemeral ? null : store.get(key);
-	const compactionHandoff =
+	let existing = ephemeral ? null : store.get(key);
+	let compactionHandoff =
 		!ephemeral && !existing?.conversationId && Boolean(deps.pendingCompactionHandoff?.has(key));
 	const messageCount = context.messages.length;
 	const config = loadConfig();
@@ -1728,6 +1823,25 @@ async function runTurnDriver(
 	// agy receives the result via the bridge's MCP HTTP response.
 	const results = collectToolResults(context.messages, deps.roundTrips.pendingIds);
 	const isContinuation = results.length > 0;
+
+	// External context compression (e.g. billion-context-pi auto-pruning or
+	// compress) shrinks/rewrites Pi's transcript without firing session_compact.
+	// Rotate the bound agy conversation before dispatching a fresh turn so
+	// agy's server-side history frees alongside Pi's compacted context.
+	if (
+		!ephemeral &&
+		!isContinuation &&
+		config.rotateOnContextCompression &&
+		shouldRotateOnTranscriptShrink(existing, context.messages)
+	) {
+		const rotated = rotateSessionOnCompaction(store, key, deps.pendingCompactionHandoff);
+		if (rotated) {
+			deps.log?.("external-compression-rotate", { key, previousConversation: rotated, prevCount: existing?.lastMessageCount, messageCount }, "info");
+			existing = null;
+			compactionHandoff = true;
+			settleSummaryId = undefined;
+		}
+	}
 	// Scanned before the resolve loop: the pending set must still contain the
 	// parks being resolved. The steering floor is the session's dispatch
 	// cursor when one exists (dispatch length + delivered-through), else the
@@ -2055,8 +2169,9 @@ async function runTurnDriver(
 				// inputFor hard-fails past the outbound frame budget and the
 				// coordinator calls throw on invariants: both must fail the turn
 				// visibly, not surface as an unhandled rejection.
+				const promptOpts: FullPromptOptions = { codemodeOnly: codemodeNote, codemodePure: config.codemodePure, directTools: config.codemodeDirectTools };
 				const input = turn.inputFor({
-					prompt: buildFullPrompt(sys, "", userPrompt ?? "", { codemodeOnly: codemodeNote }) + stageImageNote(syncImages),
+					prompt: buildFullPrompt(sys, "", userPrompt ?? "", promptOpts) + stageImageNote(syncImages),
 					images: syncImages,
 				});
 				turn.bound(key);
@@ -2086,7 +2201,7 @@ async function runTurnDriver(
 						// history to a fresh conversation; the gate re-opens there.
 						const fresh = turn.loadFailed({
 							prompt:
-								buildFullPrompt(config.systemPrompt ? getCurrentSystemPrompt(context.messages) || undefined : undefined, "", userPrompt ?? "", { codemodeOnly: codemodeNote }) +
+								buildFullPrompt(config.systemPrompt ? getCurrentSystemPrompt(context.messages) || undefined : undefined, "", userPrompt ?? "", promptOpts) +
 								stageImageNote(syncImages),
 							images: syncImages,
 						});
@@ -2199,7 +2314,9 @@ async function runTurnDriver(
 					[
 						SYSTEM_PROMPT_PREAMBLE,
 						rawSysPrompt,
-						codemodeNote ? `${TOOL_PRIORITY_NOTE}\n\n${CODEMODE_NOTE}` : TOOL_PRIORITY_NOTE,
+						codemodeNote
+							? buildCodemodePriorityNote({ pure: config.codemodePure, directTools: config.codemodeDirectTools })
+							: TOOL_PRIORITY_NOTE,
 					].join("\n\n"),
 				);
 				if (stagedName) {
@@ -2251,7 +2368,7 @@ async function runTurnDriver(
 						// Both features off: the variant would equal the plain prompt.
 						if (!fbSys && !freshDigest?.text) return undefined;
 						return {
-							prompt: buildFullPrompt(fbSys, "", deliveredPrompt, { codemodeOnly: codemodeNote }) + stageImageNote(runImages),
+							prompt: buildFullPrompt(fbSys, "", deliveredPrompt, { codemodeOnly: codemodeNote, codemodePure: config.codemodePure, directTools: config.codemodeDirectTools }) + stageImageNote(runImages),
 							contextBlock: freshDigest?.text
 								? {
 										uri: `urn:pi-bridge:context-digest/fresh/${messageCount}`,
@@ -2264,7 +2381,11 @@ async function runTurnDriver(
 		const fullPrompt =
 			(late.length > 0
 				? buildLateResultPrompt(late, deliveredPrompt || undefined)
-				: buildFullPrompt(sysPrompt, embeddedDigest ? "" : digestFinal, deliveredPrompt, { codemodeOnly: codemodeNote })) +
+				: buildFullPrompt(sysPrompt, embeddedDigest ? "" : digestFinal, deliveredPrompt, {
+						codemodeOnly: codemodeNote,
+						codemodePure: config.codemodePure,
+						directTools: config.codemodeDirectTools,
+					})) +
 			stageImageNote(runImages);
 		if (!syncTurn) {
 			try {
@@ -2434,7 +2555,21 @@ async function runTurnDriver(
 		const quota = detectQuotaNotice(outcome.response);
 		if (quota) {
 			deps.log?.("turn-error", { reason: "quota-exhausted", resetsIn: quota.resetsIn ?? null }, "error");
-			finalize(stream, blocks, "error", quotaErrorMessage(quota));
+			let msg = quotaErrorMessage(quota);
+			if (deps.onQuotaExhausted) {
+				try {
+					const rot = await deps.onQuotaExhausted(quota, key);
+					if (rot.rotated && rot.to) {
+						store.delete(key);
+						if (outcome.conversationId) stagedAgentByConversation.delete(outcome.conversationId);
+						const who = rot.email ? `${rot.to} (${rot.email})` : rot.to;
+						msg = `Antigravity rate limit reached; switched account to ${who}. Retry to continue on the new account.`;
+					}
+				} catch (err) {
+					deps.log?.("account-rotate-error", { error: err instanceof Error ? err.message : String(err) }, "warn");
+				}
+			}
+			finalize(stream, blocks, "error", msg);
 			return;
 		}
 	}
@@ -2747,6 +2882,7 @@ export function createStreamSimple(
 				pendingCompactionHandoff: deps.pendingCompactionHandoff,
 				handoffRuntime,
 				hasActiveTool: deps.hasActiveTool,
+				onQuotaExhausted: deps.onQuotaExhausted,
 				// Record the engine of the driver that will ACTUALLY run: if the
 				// ACP driver is absent, the config switch falls back to stream,
 				// and keying the session as @acp would store a stream
