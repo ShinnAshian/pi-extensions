@@ -1,5 +1,7 @@
 # pi-antigravity-bridge
 
+> **Fork notice:** This fork extends upstream `@estebanforge/pi-antigravity-bridge@1.15.1` with multi-account management & quota auto-rotation, an official-CLI `generate_image` tool, Pi 1.6.0 pure `codemode` inline declarations, external context-compression sync, and Windows `agy.exe` discovery. See [FORK_CHANGES.md](FORK_CHANGES.md) for full details.
+
 A Gemini model provider **and** the `AskAntigravity` delegation tool for [pi](https://github.com/earendil-works/pi), built on the official `agy` CLI: **`agy acp`** by default, with the stream-json CLI engine kept as the fallback. It registers `antigravity/gemini-*` models in pi's `/model` picker (streaming), and provides the `AskAntigravity` tool for one-shot delegation - the same combined shape as `pi-claude-bridge`.
 
 
@@ -117,7 +119,13 @@ If `agy models` fails at load (binary missing, auth not done, network stall), a 
 | --- | --- | --- |
 | `askTool` | `true` (register the AskAntigravity delegation tool), `false` (no delegation tool; provider and models only) | `true` |
 | `webTools` | `false` (no web tools), `true` (register `agy_web_search` + `agy_read_url` as Pi tools, usable by ANY provider's model). Each call spawns a one-shot search-only `agy` agent (plan mode, bridge MCP inheritance off), gates the answer on an observed native `search_web`/`read_url_content` step, and spends Antigravity quota. Off by default: Antigravity sessions already have native web tools on both engines; these serve other providers | `false` |
-| `bridgeTools` | `none` (bridge off), `all` (every non-builtin tool, incl. other `Ask*` delegations), `mcp` (pi-mcp-adapter tools + skills bridge only), `codemode` (pi's `codemode` tool + the info/call pair only; requires pi's codemode tool to be active, e.g. `--tools codemode`) | `all` |
+| `bridgeTools` | `none` (bridge off), `all` (every non-builtin tool, incl. other `Ask*` delegations), `mcp` (pi-mcp-adapter tools + skills bridge only), `codemode` (pi's `codemode` tool with inline `Nested tools:` TS declarations + `codemodeDirectTools`; requires pi's codemode tool to be active, e.g. `--tools codemode`) | `codemode` |
+| `codemodeDirectTools` | Tool names kept directly exposed alongside `codemode` in codemode mode | `["ask_user_question"]` |
+| `codemodePure` | `true` to omit `bridge_tool_info` / `bridge_call_tool` proxies in codemode mode, `false` to keep them | `true` |
+| `codemodeInlineBudget` | Estimated token budget (`0`–`50000`) for inline `Nested tools:` declarations | `4000` |
+| `imageTool` | `true` to register the official-CLI `generate_image` Pi tool, `false` to disable | `true` |
+| `autoRotateAccounts` | `true` to automatically rotate saved accounts in `accounts.json` on quota exhaustion | `true` |
+| `rotateOnContextCompression` | `true` to rotate bound `agy` conversations when external context compression shrinks/rewrites Pi's transcript | `true` |
 | `digest` | Self-gating delta of pi-side context (compaction summaries, other-provider turns, handoffs after a mid-session switch) shipped to agy only when the delta is non-empty, each piece once. Pure antigravity sessions get byte-stable prompts and an intact prompt cache. `false` = agy prompts contain only your message; a conversation opened mid-session starts without prior pi-side context | `true` |
 | `systemPrompt` | `on` (send pi's system prompt - operating instructions plus the global agent-dir `AGENTS.md` and ancestor `AGENTS.md`/`CLAUDE.md` - to the first prompt of each new agy conversation, plus a tool-priority note: Pi Bridge tools win over agy's native interactive ones, which never reach the user. Delivery: stream-json stages it as an agy agent file via `--agent`, off the prompt line - the CLI silently drops single prompts past a ~25KB cap and the dropped turn kills the conversation; the carrier declares the productive toolset explicitly (omitting `tools:` reads as a read-only set upstream, issue #13) plus `subagent: false` + `agents: []` so the native subagent tools stay masked (ACP carries no agent file, so its natives remain and the tool-priority note steers the model to pi delegation). ACP prepends it to the first prompt) or `false` (agy-native behavior) | `true` |
 | `readOnly` | `true`: fail-closed kill switch - every provider turn and the `AskAntigravity` tool are refused with a visible error (the CLI has no review-only enforcement, see [Permissions](#permissions) and [readOnly](#readonly)). In the file, any value that is not a recognized boolean spelling (or an explicit blank) also fails closed to `true` | `false` |
@@ -129,7 +137,7 @@ If `agy models` fails at load (binary missing, auth not done, network stall), a 
 
 Boolean keys (`readOnly`, `skipPermissions`, `askTool`, `webTools`, `digest`, `systemPrompt`, `acp.sessionRetryOnTimeout`) take JSON booleans, the `/agy` vocabulary as strings (`on`/`off`, `1`/`0`, case and whitespace tolerated), and the JSON numbers `0`/`1`, so a hand-edited `"off"` means off instead of silently on (issue #23). Unrecognized values fall back to the key's default - `readOnly` falls closed to `true` - and surface a `config warnings:` row in `/agy doctor` plus a startup warning toast. The `AGY_*` env vars keep their own grammars: notably `AGY_SKIP_PERMISSIONS` does not accept `on` (only `1`/`true` enable there), and while an env var is set the matching file value is never parsed, so it emits no warning for the value it overrides.
 
-Env overrides: `AGY_BRIDGE_TOOLS`, `AGY_ASK_TOOL`, `AGY_WEB_TOOLS`, `AGY_DIGEST`, `AGY_SYSTEM_PROMPT`, `AGY_TURN_TIMEOUT_MIN`, `AGY_INACTIVITY_TIMEOUT_MIN`, `AGY_ACP_SESSION_TIMEOUT_MS`, `AGY_ACP_SESSION_RETRY`. Env wins over the file, so while `AGY_DIGEST` or `AGY_SYSTEM_PROMPT` is set, the matching `/agy digest` or `/agy system-prompt` toggle persists a value that never takes effect.
+Env overrides: `AGY_BRIDGE_TOOLS`, `AGY_ASK_TOOL`, `AGY_WEB_TOOLS`, `AGY_IMAGE_TOOL`, `AGY_AUTO_ROTATE_ACCOUNTS`, `AGY_CODEMODE_DIRECT_TOOLS`, `AGY_CODEMODE_PURE`, `AGY_CODEMODE_INLINE_BUDGET`, `AGY_ROTATE_ON_COMPRESSION`, `AGY_DIGEST`, `AGY_SYSTEM_PROMPT`, `AGY_TURN_TIMEOUT_MIN`, `AGY_INACTIVITY_TIMEOUT_MIN`, `AGY_ACP_SESSION_TIMEOUT_MS`, `AGY_ACP_SESSION_RETRY`. Env wins over the file, so while `AGY_DIGEST` or `AGY_SYSTEM_PROMPT` is set, the matching `/agy digest` or `/agy system-prompt` toggle persists a value that never takes effect.
 
 The `activate_skill` catalog mirrors pi's directory-based skill discovery: the two global dirs plus project dirs, the latter only when pi has trusted the project (same gate pi itself applies). Pi's other skill sources - the `skills` settings array, `package.json` entries, and `--skill` CLI paths - are not mirrored and won't appear in the catalog.
 
@@ -141,6 +149,8 @@ The `activate_skill` catalog mirrors pi's directory-based skill discovery: the t
 /agy                      status summary, or open the full settings picker (TUI)
 /agy doctor               single status surface: bridge state, driver counters, versions, acp state, lifecycle, settings, log dir
 /agy auth                 show the shared agy CLI sign-in instruction
+/agy accounts [subcmd]    manage saved Google accounts in OS keyring: list, save [name], use <name>, login [name], remove <name>, auto on|off
+/agy image [on|off|<prompt>]  toggle the generate_image tool or generate an image directly from a prompt
 /agy mode plan            provider turns are REFUSED (the CLI cannot enforce review-only, #1181)
 /agy mode accept-edits    agy applies edits directly (default)
 /agy permissions on|off   auto-approve / prompt for tool calls (see warning)

@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased - Fork]
+
+See [FORK_CHANGES.md](FORK_CHANGES.md) for full details and installation instructions.
+
+### Added
+
+- **Multi-account keyring store and quota auto-rotation** (`src/accounts.ts`, `extensions/index.ts`, `src/provider.ts`): encrypted OS keyring vault (Windows DPAPI, macOS Keychain, Linux `secret-tool`) with async non-blocking operations, auto-numbered slots with case-insensitive email reuse, multi-log email detection (including `acp-login-*.log`), interactive `/agy` Accounts submenu & `/agy accounts` commands (`list`, `save`, `use`, `login` with browser auth-code stdin relay, `remove`, `auto on|off`), and automatic cooldown rotation on quota exhaustion (`autoRotateAccounts` / `AGY_AUTO_ROTATE_ACCOUNTS`).
+- **Official-CLI `generate_image` tool** (`src/image-tool.ts`, `extensions/index.ts`): restricted `agy` agent invoking native `generate_image` with `.tempmediaStorage` artifact extraction, aspect ratios, up to 4 reference images, quota-rotation retry, and `/agy image [on|off|<prompt>]` (`imageTool` / `AGY_IMAGE_TOOL`).
+- **Pi 1.6.0 pure `codemode` inline declarations** (`src/codemode-description.ts`, `src/bridge-catalog.ts`, `src/provider.ts`): self-contained `Nested tools:` TypeScript declarations budgeted by `codemodeInlineBudget` (`4000`), exposure-aware `codemodeNestedTools()`, `codemodeDirectTools` (default `["ask_user_question"]`), `codemodePure` (default `true`, omitting redundant proxies), and cohesive `buildCodemodePriorityNote()`.
+- **External context compression sync** (`src/provider.ts`, `extensions/index.ts`): detects `billion-context-pi` `compress` / `▣ ACP |` and transcript shrink (`shouldRotateOnTranscriptShrink()`) to rotate bound `agy` conversations (`rotateOnContextCompression` / `AGY_ROTATE_ON_COMPRESSION`), and preserves `compress` summaries up to 6,000 chars in handoff digests.
+- **Windows `agy.exe` discovery fallback** (`extensions/index.ts`): `resolveAgyBinary()` locates `%LOCALAPPDATA%\agy\bin\agy.exe` when missing from `PATH`.
+
+### Changed
+
+- Default `bridgeTools` surface changed from `"all"` to `"codemode"` (set `"bridgeTools": "all"` or `AGY_BRIDGE_TOOLS=all` to restore the upstream default).
+
 ## [1.15.1] - 2026-11-25
 
 ### Fixed
