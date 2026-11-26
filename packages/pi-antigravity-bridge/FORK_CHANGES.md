@@ -1,8 +1,8 @@
 # Fork Changes (`@estebanforge/pi-antigravity-bridge`)
 
-This repository is a fork of [EstebanForge/pi-extensions](https://github.com/EstebanForge/pi-extensions) containing enhancements to `packages/pi-antigravity-bridge` built on top of upstream `v1.15.1`.
+This repository is a fork of [EstebanForge/pi-extensions](https://github.com/EstebanForge/pi-extensions) containing enhancements to `packages/pi-antigravity-bridge` built on top of upstream `v1.16.0`.
 
-## File Inventory (vs. Upstream `1.15.1`)
+## File Inventory (vs. Upstream `1.16.0`)
 
 | File | Status | Purpose |
 | --- | --- | --- |

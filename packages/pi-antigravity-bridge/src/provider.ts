@@ -252,7 +252,7 @@ export const SYSTEM_PROMPT_END = "[END SYSTEM PROMPT]";
  *  the user's machine must go through the bridge. Rides the systemPrompt
  *  gate: the note ships only when the system prompt ships. */
 export const TOOL_PRIORITY_NOTE =
-	"[Tool priority: this conversation runs inside pi, not as a standalone agy session; the user only sees what surfaces in pi. Native interactive tools, for example ask_question, never reach the user. When a Pi Bridge tool covers the same purpose, always use the Pi Bridge tool; for user questions use ask_user_question. Your native file tools such as view_file only read brain artifacts and reject real filesystem paths; for any path on the user's machine use the Pi Bridge tools (read, ls, grep, find, edit, write, bash). Image files are visible to you: the Pi Bridge read tool returns image files as visible images (png, jpg, webp, gif, bmp), so never claim you cannot view images. Extension Pi tools not declared directly are listed in bridge_tool_info; call bridge_tool_info to inspect their description and schema, then call bridge_call_tool to run them. When a bridge call answers STILL RUNNING, poll bridge_poll_result before doing other work: until you poll, the result (including any image) stays undelivered to you. Delegate subagent work the same way: when pi's tool list includes a delegation tool (for example subagent, Agent, agent_spawn, agent_wait, or subagent_run), always delegate through it and never through the native invoke_subagent, run_subagent, or manage_subagents; use native ones only if no pi delegation tool is listed, because native subagents run inside agy and are invisible to pi and anything watching it. Long-running bridge calls do not fail: after ~20 seconds the bridge answers STILL RUNNING with a callId; fetch the result with bridge_poll_result and poll until it lands. Your turn ends when your reply ends, and pi never waits for agy's own wake-ups: never let a native run_command go to the background (keep WaitMsBeforeAsync at 0 for foreground runs and native commands under two minutes, since longer foreground waits hit pi's idle cap and kill the turn; wrap long commands in timeout and run anything longer through the Pi Bridge bash tool, which keeps it inside your turn, and poll bridge_poll_result if it answers STILL RUNNING) and never use the native schedule tool or timers. A task left running when you reply outlives your turn: its wake-up cannot call Pi Bridge tools, and a delegated subagent session is already gone when it fires.]";
+	"[Tool priority: this conversation runs inside pi, not as a standalone agy session; the user only sees what surfaces in pi. Native interactive tools, for example ask_question, never reach the user. When a Pi Bridge tool covers the same purpose, always use the Pi Bridge tool; for user questions use ask_user_question. Your native file tools such as view_file only read brain artifacts and reject real filesystem paths; for any path on the user's machine use the Pi Bridge tools (read, ls, grep, find, edit, write, bash). Image files are visible to you: the Pi Bridge read tool returns image files as visible images (png, jpg, webp, gif, bmp), so never claim you cannot view images. Extension Pi tools not declared directly are listed in bridge_tool_info; call bridge_tool_info to inspect their description and schema, then call bridge_call_tool to run them. When a bridge call answers STILL RUNNING, poll bridge_poll_result before doing other work: until you poll, the result (including any image) stays undelivered to you. If a poll answer tells you to stop polling and end your turn, obey it: the result is delivered as your next message. Delegate subagent work the same way: when pi's tool list includes a delegation tool (for example subagent, Agent, agent_spawn, agent_wait, or subagent_run), always delegate through it and never through the native invoke_subagent, run_subagent, or manage_subagents; use native ones only if no pi delegation tool is listed, because native subagents run inside agy and are invisible to pi and anything watching it. Long-running bridge calls do not fail: after ~20 seconds the bridge answers STILL RUNNING with a callId; fetch the result with bridge_poll_result and poll until it lands. Your turn ends when your reply ends, and pi never waits for agy's own wake-ups: never let a native run_command go to the background (keep WaitMsBeforeAsync at 0 for foreground runs and native commands under two minutes, since longer foreground waits hit pi's idle cap and kill the turn; wrap long commands in timeout and run anything longer through the Pi Bridge bash tool, which keeps it inside your turn, and poll bridge_poll_result if it answers STILL RUNNING) and never use the native schedule tool or timers. A task left running when you reply outlives your turn: its wake-up cannot call Pi Bridge tools, and a delegated subagent session is already gone when it fires.]";
 
 /** Assemble the full agy prompt: system prompt block, pi-side digest, user
  *  prompt. Empty parts are dropped. Pure; exported for unit testing.
@@ -268,6 +268,7 @@ export interface FullPromptOptions {
 	codemodeOnly?: boolean;
 	codemodePure?: boolean;
 	directTools?: readonly string[];
+	acpToolsDirect?: boolean;
 }
 
 /** Cohesive tool-priority instruction for codemode-first sessions: avoids
@@ -281,8 +282,16 @@ export function buildCodemodePriorityNote(opts?: { pure?: boolean; directTools?:
 	const discoveryClause = opts?.pure
 		? "Inspect or discover unlisted/deferred Pi tools inside codemode via ALL_TOOLS, await searchTools(query), and await describeTool(name)."
 		: "Inspect unlisted Pi tools inside codemode via ALL_TOOLS / searchTools / describeTool (or bridge_tool_info / bridge_call_tool).";
-	return `[Tool priority (codemode): this conversation runs inside pi, not as a standalone agy session; the user only sees what surfaces in pi. ${directClause} NEVER use agy native filesystem, shell, search, subagent, artifact, or schedule tools (view_file, read_file, edit_file, write_file, run_command, grep_search, find_by_name, invoke_subagent, run_subagent, manage_subagents, schedule, <artifacts>, /goal): native file tools reject real paths and native subagents/timers are invisible to pi. Run ALL file, shell, codebase-memory, file-search, web-search, delegation, and context-management work inside MCP codemode scripts (await tools.read, tools.bash, tools.edit, tools.write, etc.); batch independent calls with Promise.allSettled and filter bulky outputs inside JS. ${discoveryClause} Image files returned by tools.read or image() inside codemode are visible to you. Long-running bridge calls answer STILL RUNNING with a callId after ~20s; poll bridge_poll_result until the result lands before finishing your turn.]`;
+	return `[Tool priority (codemode): this conversation runs inside pi, not as a standalone agy session; the user only sees what surfaces in pi. ${directClause} NEVER use agy native filesystem, shell, search, subagent, artifact, or schedule tools (view_file, read_file, edit_file, write_file, run_command, grep_search, find_by_name, invoke_subagent, run_subagent, manage_subagents, schedule, <artifacts>, /goal): native file tools reject real paths and native subagents/timers are invisible to pi. Run ALL file, shell, codebase-memory, file-search, web-search, delegation, and context-management work inside MCP codemode scripts (await tools.read, tools.bash, tools.edit, tools.write, etc.); batch independent calls with Promise.allSettled and filter bulky outputs inside JS. ${discoveryClause} Image files returned by tools.read or image() inside codemode are visible to you. Long-running bridge calls answer STILL RUNNING with a callId after ~20s; poll bridge_poll_result until the result lands before finishing your turn. If a poll answer tells you to stop polling and end your turn, obey it: the result is delivered as your next message.]`;
 }
+
+/** Appended after the tool-priority note when the engine's catalog actually
+ *  declares pi's builtins directly (bridgeTools "all" on ACP). On ACP the
+ *  native tools run agy-side and a silent native command past the bridge's
+ *  5-minute stall guard is killed, so the note must move long commands onto
+ *  the bridge bash surface where polls keep the call alive. */
+export const ACP_TOOL_NOTE =
+	"[ACP note: the Pi Bridge tools (read, ls, grep, find, edit, write, bash) are in your tool list; call them directly. For anything that may run longer than a minute use the Pi Bridge bash tool, never native run_command or execute: a silent native command running longer than five minutes is killed and its result is lost. Bridge bash calls are safe over long waits: the bridge answers STILL RUNNING with a callId and polling delivers the result even after many minutes. Keep native commands for short tasks only.]";
 
 export function buildFullPrompt(
 	systemPrompt: string | undefined,
@@ -292,10 +301,7 @@ export function buildFullPrompt(
 ): string {
 	const parts: string[] = [];
 	if (systemPrompt) {
-		const note = options?.codemodeOnly
-			? buildCodemodePriorityNote({ pure: options.codemodePure, directTools: options.directTools })
-			: TOOL_PRIORITY_NOTE;
-		parts.push(`${SYSTEM_PROMPT_PREAMBLE}\n\n${systemPrompt}\n\n${note}\n\n${SYSTEM_PROMPT_END}`);
+		parts.push(`${SYSTEM_PROMPT_PREAMBLE}\n\n${systemPrompt}\n\n${toolNotes(options)}\n\n${SYSTEM_PROMPT_END}`);
 	}
 	if (digest) {
 		parts.push(`${DIGEST_PREAMBLE}\n\n${digest}`);
@@ -304,6 +310,17 @@ export function buildFullPrompt(
 		parts.push(prompt);
 	}
 	return parts.join("\n\n---\n\n");
+}
+
+/** Shared note composition for the system prompt block and the stream-json
+ *  staged agent file (which concatenates the notes without buildFullPrompt). */
+function toolNotes(options?: FullPromptOptions): string {
+	if (options?.codemodeOnly) {
+		return buildCodemodePriorityNote({ pure: options.codemodePure, directTools: options.directTools });
+	}
+	const parts = [TOOL_PRIORITY_NOTE];
+	if (options?.acpToolsDirect) parts.push(ACP_TOOL_NOTE);
+	return parts.join("\n\n");
 }
 
 /** Flatten any message content shape (string or content-block array) to text.
@@ -775,6 +792,11 @@ export interface StreamSimpleDeps {
 	onNativeBackground?: (info: { conversationId: string; turnStartMs: number }) => void;
 	/** Subagent roster (both engines); folded from every activity. */
 	roster?: SubagentRoster;
+	/** Why the approval gate this session requires is not staged, or
+	 *  undefined when it is staged or not required. A set reason refuses
+	 *  provider turns: an unstaged gate would let agy's native tools run
+	 *  without the pi-side approval the config asked for. */
+	gateUnavailable?: () => string | undefined;
 	/** Session keys rotated on `session_compact` awaiting a one-shot
 	 *  compaction handoff into a fresh agy conversation. */
 	pendingCompactionHandoff?: Set<string>;
@@ -890,6 +912,9 @@ export interface PollView {
 	 *  markDelivered (the real poll path); poll() stays pure so internal
 	 *  peeks (escalatedNames) never mark. */
 	delivered?: boolean;
+	/** Still-running poll answers served to the model (the poll path only).
+	 *  The handoff in formatPollAnswer arms at POLL_HANDOFF_AFTER. */
+	pollAnswers?: number;
 	/** The agy conversation this call belongs to. Stamped at turn end so an
 	 *  unpolled result can be re-delivered to the right conversation
 	 *  (first-turn parks never reach the provider's store.set). */
@@ -900,6 +925,7 @@ export interface PollView {
  *  evict first (a running call is never evicted while a newer one is). */
 export class EscalationRegistry {
 	#calls = new Map<string, PollView>();
+	#waiters = new Map<string, Set<() => void>>();
 	#trim(): void {
 		// Soft cap: only settled entries evict. Evicting a RUNNING call would
 		// strand its result (settle becomes a no-op, poll reports unknown), so
@@ -925,6 +951,7 @@ export class EscalationRegistry {
 		e.isError = isError;
 		if (images.length > 0) e.images = images;
 		this.#trim();
+		this.#fireWaiters(callId);
 	}
 	settleFailed(callId: string, reason: string): void {
 		const e = this.#calls.get(callId);
@@ -932,6 +959,42 @@ export class EscalationRegistry {
 		e.state = "failed";
 		e.reason = reason;
 		this.#trim();
+		this.#fireWaiters(callId);
+	}
+
+	#fireWaiters(callId: string): void {
+		const waiters = this.#waiters.get(callId);
+		if (!waiters) return;
+		this.#waiters.delete(callId);
+		for (const wake of waiters) wake();
+	}
+
+	/** Resolve when the call settles, the window elapses, or signal aborts.
+	 *  Turn end and shutdown do not settle escalated entries (failAll spares
+	 *  them), so the abort listener and the window are the wake-up paths for
+	 *  abandoned polls. The caller re-reads through poll(), which stays the
+	 *  single pure read path. */
+	waitForSettle(callId: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+		const entry = this.#calls.get(callId);
+		if (!entry || entry.state !== "running" || signal?.aborted) return Promise.resolve();
+		return new Promise<void>((resolve) => {
+			let done = false;
+			const waiters = this.#waiters.get(callId) ?? new Set<() => void>();
+			this.#waiters.set(callId, waiters);
+			const finish = () => {
+				if (done) return;
+				done = true;
+				clearTimeout(timer);
+				waiters.delete(finish);
+				if (waiters.size === 0 && this.#waiters.get(callId) === waiters) this.#waiters.delete(callId);
+				if (signal) signal.removeEventListener("abort", finish);
+				resolve();
+			};
+			waiters.add(finish);
+			const timer = setTimeout(finish, timeoutMs);
+			timer.unref?.();
+			if (signal) signal.addEventListener("abort", finish, { once: true });
+		});
 	}
 	poll(callId: string): PollView | undefined {
 		const e = this.#calls.get(callId);
@@ -946,6 +1009,16 @@ export class EscalationRegistry {
 		if (!e || e.state === "running") return false;
 		e.delivered = true;
 		return true;
+	}
+
+	/** Count a STILL RUNNING answer served to the model (the poll path only).
+	 *  formatPollAnswer turns the count into a turn-end handoff at
+	 *  POLL_HANDOFF_AFTER; the settled result then reaches the model through
+	 *  the strand sweep instead of further polls. */
+	noteStillRunningPoll(callId: string): void {
+		const e = this.#calls.get(callId);
+		if (!e || e.state !== "running") return;
+		e.pollAnswers = (e.pollAnswers ?? 0) + 1;
 	}
 
 	/** Single-use claim of a done-but-undelivered result: returns the view
@@ -1003,13 +1076,53 @@ export function formatEscalatedAck(e: BridgeEscalation): BridgeCallResultShape {
 				type: "text",
 				text: [
 					`STILL RUNNING: the pi tool "${e.name}" has not finished yet.`,
-					`Call ${POLL_TOOL_NAME} with callId "${e.callId}" to get the result. Poll again if it still reports running; you may do other work between polls.`,
-					"Do NOT end your turn while this call is unresolved: keep polling until it reports done or failed. Ending the turn strands the result.",
+					`Call ${POLL_TOOL_NAME} with callId "${e.callId}" to get the result. Call it again immediately after each answer: each poll now blocks up to 110 seconds and returns the moment the call settles. Do other work between polls only when that work is genuinely useful.`,
+					"Keep polling until the call reports done or failed. If a poll answer tells you to stop polling and end your turn, obey it: the bridge delivers the result as your next message in this conversation. Ending the turn on your own initiative, without that instruction, strands the result.",
 				].join("\n"),
 			},
 		],
 		isError: false,
 	};
+}
+
+/** Long-waiting bridge_poll_result (issue #29): a running call holds the
+ *  request up to POLL_WAIT_MS for an instant settle, because every early
+ *  STILL RUNNING costs agy a full LLM turn (quota + context). Settle wakes
+ *  the waiter immediately, so the window only bounds still-running holds;
+ *  110s stays under agy's ~180s request deadline with the 120s delegation
+ *  hold as production precedent, and a poll killed by that deadline is
+ *  harmless (abort skips the delivered mark). Turn end and shutdown do not
+ *  settle escalated entries (failAll spares them), so the abort and the
+ *  window are the wake-up paths for abandoned polls. An abort skips
+ *  markDelivered: marking a result the client never received would strand
+ *  it away from the redelivery paths. Accepted gap (unchanged): the mark
+ *  fires when the poll ANSWERS, not when the HTTP response lands. */
+export const POLL_WAIT_MS = 110_000;
+
+/** Still-running poll answers served before the poll answer switches to the
+ *  turn-end handoff. Every poll answer costs agy a full inference, so a
+ *  30-minute human-gated park costs roughly this constant plus the ack
+ *  instead of one call per minute; the settled result then reaches the
+ *  model through the dead-turn strand sweep (claimAllUndelivered is
+ *  registry-wide, so sibling parks ride the same handoff). */
+export const POLL_HANDOFF_AFTER = 3;
+
+export async function answerPoll(
+	roundTrips: Pick<ToolRoundTrips, "poll" | "markDelivered" | "waitForSettle" | "noteStillRunningPoll">,
+	callId: string,
+	signal: AbortSignal,
+	log?: (event: string, data?: unknown) => void,
+): Promise<BridgeCallResultShape> {
+	if (roundTrips.poll(callId)?.state === "running") {
+		await roundTrips.waitForSettle(callId, POLL_WAIT_MS, signal);
+	}
+	const view = roundTrips.poll(callId);
+	if (view && view.state === "running" && !signal.aborted) {
+		if ((view.pollAnswers ?? 0) >= POLL_HANDOFF_AFTER) log?.("poll-handoff", { callId, name: view.name });
+		roundTrips.noteStillRunningPoll(callId);
+	}
+	if (view && view.state !== "running" && !signal.aborted) roundTrips.markDelivered(callId);
+	return formatPollAnswer(callId, view);
 }
 
 export function formatPollAnswer(callId: string, view: PollView | undefined): BridgeCallResultShape {
@@ -1025,8 +1138,16 @@ export function formatPollAnswer(callId: string, view: PollView | undefined): Br
 		};
 	}
 	if (view.state === "running") {
+		const handoff = (view.pollAnswers ?? 0) >= POLL_HANDOFF_AFTER;
 		return {
-			content: [{ type: "text", text: `STILL RUNNING: "${view.name}" (callId ${callId}) has not finished. Poll again later.` }],
+			content: [
+				{
+					type: "text",
+					text: handoff
+						? `STILL RUNNING: "${view.name}" (callId ${callId}) is taking long. Stop polling: end your turn now, and the bridge will deliver the result as your next message in this conversation. Do not call ${POLL_TOOL_NAME} again for this callId.`
+						: `STILL RUNNING: "${view.name}" (callId ${callId}) has not finished. Call ${POLL_TOOL_NAME} again now: it blocks up to 110 seconds and returns the moment the call settles.`,
+				},
+			],
 			isError: false,
 		};
 	}
@@ -1148,10 +1269,21 @@ export class ToolRoundTrips {
 		return this.#escalations.markDelivered(callId);
 	}
 
+	waitForSettle(callId: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+		return this.#escalations.waitForSettle(callId, timeoutMs, signal);
+	}
+
 	/** Single-use claim of a settled-but-undelivered escalated result (the
 	 *  model ended its turn instead of polling). */
 	claimUndelivered(callId: string): (PollView & { callId: string }) | undefined {
 		return this.#escalations.claimUndelivered(callId);
+	}
+
+	/** Count a STILL RUNNING answer served to the model (the poll path only);
+	 *  formatPollAnswer turns the count into a turn-end handoff at
+	 *  POLL_HANDOFF_AFTER. */
+	noteStillRunningPoll(callId: string): void {
+		return this.#escalations.noteStillRunningPoll(callId);
 	}
 
 	/** Registry-wide sweep for done-but-undelivered results: a toolResult is
@@ -1917,7 +2049,7 @@ async function runTurnDriver(
 			return {
 				callId: view.callId,
 				name: view.name,
-				reason: "you never received this result: you ended your turn without calling bridge_poll_result",
+				reason: "the call settled after your turn ended; the result is delivered here so the work is not lost",
 				text: view.text ?? "(no output)",
 				isError: view.isError ?? false,
 				images: view.images,
@@ -1973,6 +2105,20 @@ async function runTurnDriver(
 			codemodeNote = true;
 		}
 	}
+	// The ACP note ships only when the engine's catalog actually declares
+	// pi's builtins: bridgeTools "all" on ACP AND bash in pi's active set
+	// (pi can start with a narrowed toolset; a hidden bash is a deliberate
+	// session-local override and keeps the note). Without the probe the note
+	// would point at tools agy cannot call and forbid its only working ones.
+	// Same staleness window as codemodeNote: a /agy bridge flip re-reads on
+	// the next conversation, the held one keeps its note until then.
+	let acpBashActive = true;
+	try {
+		acpBashActive = deps.hasActiveTool?.("bash") ?? true;
+	} catch {
+		acpBashActive = true;
+	}
+	const acpToolsDirect = deps.engine === "acp" && config.bridgeTools === "all" && acpBashActive;
 	// The sync orchestrator for THIS pass when the sync gate dispatched; the
 	// settle (and the park persist) sit outside the fresh-pass block, so the
 	// binding is function-level (the round-1 settle scope trap).
@@ -2169,7 +2315,7 @@ async function runTurnDriver(
 				// inputFor hard-fails past the outbound frame budget and the
 				// coordinator calls throw on invariants: both must fail the turn
 				// visibly, not surface as an unhandled rejection.
-				const promptOpts: FullPromptOptions = { codemodeOnly: codemodeNote, codemodePure: config.codemodePure, directTools: config.codemodeDirectTools };
+				const promptOpts: FullPromptOptions = { codemodeOnly: codemodeNote, codemodePure: config.codemodePure, directTools: config.codemodeDirectTools, acpToolsDirect };
 				const input = turn.inputFor({
 					prompt: buildFullPrompt(sys, "", userPrompt ?? "", promptOpts) + stageImageNote(syncImages),
 					images: syncImages,
@@ -2314,9 +2460,7 @@ async function runTurnDriver(
 					[
 						SYSTEM_PROMPT_PREAMBLE,
 						rawSysPrompt,
-						codemodeNote
-							? buildCodemodePriorityNote({ pure: config.codemodePure, directTools: config.codemodeDirectTools })
-							: TOOL_PRIORITY_NOTE,
+						toolNotes({ codemodeOnly: codemodeNote, codemodePure: config.codemodePure, directTools: config.codemodeDirectTools, acpToolsDirect }),
 					].join("\n\n"),
 				);
 				if (stagedName) {
@@ -2368,7 +2512,7 @@ async function runTurnDriver(
 						// Both features off: the variant would equal the plain prompt.
 						if (!fbSys && !freshDigest?.text) return undefined;
 						return {
-							prompt: buildFullPrompt(fbSys, "", deliveredPrompt, { codemodeOnly: codemodeNote, codemodePure: config.codemodePure, directTools: config.codemodeDirectTools }) + stageImageNote(runImages),
+							prompt: buildFullPrompt(fbSys, "", deliveredPrompt, { codemodeOnly: codemodeNote, codemodePure: config.codemodePure, directTools: config.codemodeDirectTools, acpToolsDirect }) + stageImageNote(runImages),
 							contextBlock: freshDigest?.text
 								? {
 										uri: `urn:pi-bridge:context-digest/fresh/${messageCount}`,
@@ -2385,6 +2529,7 @@ async function runTurnDriver(
 						codemodeOnly: codemodeNote,
 						codemodePure: config.codemodePure,
 						directTools: config.codemodeDirectTools,
+						acpToolsDirect,
 					})) +
 			stageImageNote(runImages);
 		if (!syncTurn) {
@@ -2867,6 +3012,19 @@ export function createStreamSimple(
 				blocks,
 				"error",
 				"Plan mode cannot be enforced on provider turns: the agy CLI stages a plan and executes writes in the same turn (probed 2026-10-07, google-antigravity/antigravity-cli#1181), and provider plan turns are disabled on ACP too. /agy mode accept-edits, and enforce review-only in the host.",
+			);
+			return stream;
+		}
+		const gateMissing = deps.gateUnavailable?.();
+		if (gateMissing) {
+			const partial = newAssistant(model);
+			const blocks: BlockState = { partial, textIdx: null, thinkingIdx: null, started: false };
+			deps.log?.("turn-error", { reason: "approval-gate-unavailable" }, "warn");
+			finalize(
+				stream,
+				blocks,
+				"error",
+				`The approval gate is required but not active (${gateMissing}), so agy's native tools would run without pi-side approval. Restart pi; /agy doctor shows the bridge state.`,
 			);
 			return stream;
 		}

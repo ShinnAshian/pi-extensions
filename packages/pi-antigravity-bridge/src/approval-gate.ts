@@ -22,6 +22,9 @@
 //
 // Run: npm test
 
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
@@ -230,4 +233,36 @@ export function createShadowTool(base: AnyToolDefinition, policy: GatePolicy, op
 		};
 	};
 	return { ...base, parameters: withGateMarkerSchema(base.parameters), execute } as AnyToolDefinition;
+}
+
+/** The shell options pi passes its own bash tool (shellCommandPrefix,
+ *  shellPath), read from the session's effective settings. The bash shadow
+ *  replaces pi's bash for every model, so its twin must run commands the same
+ *  way. pi expands a leading "~" and file:// URLs in shellPath; mirror that. Hosts without
+ *  pi.getSettings keep the previous option-less twin, and any throw degrades
+ *  to the same: the twin is built after the gate hooks are staged, so a
+ *  throw here would leave a required gate unstaged and refuse every turn
+ *  over what is only shell fidelity. */
+export function bashSettingsOptions(pi: {
+	getSettings?: () => { shellCommandPrefix?: string; shellPath?: string };
+}): { commandPrefix?: string; shellPath?: string } {
+	if (typeof pi.getSettings !== "function") return {};
+	try {
+		const { shellCommandPrefix, shellPath } = pi.getSettings();
+		const home = os.homedir();
+		const expanded =
+			shellPath === "~"
+				? home
+				: shellPath?.startsWith("~/")
+					? path.join(home, shellPath.slice(2))
+					: shellPath?.startsWith("file://")
+						? fileURLToPath(shellPath)
+						: shellPath;
+		return {
+			...(shellCommandPrefix ? { commandPrefix: shellCommandPrefix } : {}),
+			...(expanded ? { shellPath: expanded } : {}),
+		};
+	} catch {
+		return {};
+	}
 }

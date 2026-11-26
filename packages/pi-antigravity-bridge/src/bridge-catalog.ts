@@ -1,5 +1,5 @@
 import { buildCodemodeBridgeDescription } from "./codemode-description.js";
-import type { BridgeTools } from "./config.js";
+import type { BridgeTools, Engine } from "./config.js";
 import { POLL_TOOL_NAME } from "./provider.js";
 import { ACTIVATE_SKILL_TOOL_NAME } from "./skills.js";
 
@@ -53,6 +53,7 @@ export function bridgedPiTools(
 	active: readonly string[],
 	mode: BridgeTools,
 	hidden: ReadonlySet<string>,
+	engine: Engine,
 	extraCodemodeDirect: readonly string[] = [],
 ): BridgeToolInfo[] {
 	if (mode === "none") return [];
@@ -69,7 +70,15 @@ export function bridgedPiTools(
 			? tool.name === "codemode" || directBuiltins.has(tool.name) || tool.sourceInfo?.source !== "builtin"
 			: mode === "mcp"
 				? /pi-mcp-adapter/.test(tool.sourceInfo?.source ?? "")
-				: tool.sourceInfo?.source !== "builtin"),
+				// ACP must declare pi's default builtins directly: its native tool
+				// calls execute agy-side (provider Gate C), so pi's tools would be
+				// unreachable pi-side and long commands would bypass the poll
+				// machinery entirely. Limited to the seven defaults: a builtin like
+				// codemode stays codemode-mode-only on both engines. stream-json
+				// keeps them out: its native commands also run agy-side (pi only
+				// re-executes read-only calls for card rendering), so the catalog
+				// there stays exactly as it shipped.
+				: tool.sourceInfo?.source !== "builtin" || (engine === "acp" && PI_DEFAULT_TOOLS.has(tool.name))),
 	);
 }
 

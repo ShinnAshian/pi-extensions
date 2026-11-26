@@ -11,6 +11,8 @@ import path from "node:path";
 import { test } from "vitest";
 import { normalizeContext, type Api, type Model, type SimpleStreamOptions, type TranscriptContext } from "@earendil-works/pi-ai";
 import {
+	ACP_TOOL_NOTE,
+	CODEMODE_NOTE,
 	SYSTEM_PROMPT_END,
 	SYSTEM_PROMPT_PREAMBLE,
 	TOOL_PRIORITY_NOTE,
@@ -92,6 +94,96 @@ test("tool priority note caps native foreground waits under the idle cap", () =>
 
 test("empty-string system prompt is treated as absent", () => {
 	assert.equal(buildFullPrompt("", "", "hello"), "hello");
+});
+
+test("ACP direct-builtin sessions append the stall-guard note; other shapes do not", () => {
+	const out = buildFullPrompt(SYS, "", "hello", { acpToolsDirect: true });
+	assert.ok(out.includes(ACP_TOOL_NOTE), "ACP note rides the prompt");
+	// Inside the delimited block, after the shared note.
+	const iShared = out.indexOf(TOOL_PRIORITY_NOTE);
+	const iAcp = out.indexOf(ACP_TOOL_NOTE);
+	assert.ok(iAcp > iShared && iAcp < out.indexOf(SYSTEM_PROMPT_END));
+	// The fallback engines keep the byte-identical prompt of today.
+	assert.equal(buildFullPrompt(SYS, "", "hello").includes(ACP_TOOL_NOTE), false);
+	assert.equal(buildFullPrompt(SYS, "", "hello", { acpToolsDirect: false }).includes(ACP_TOOL_NOTE), false);
+});
+
+test("ACP stall-guard note steers long commands to bridge bash", () => {
+	// Observed live 2026-11-26: agy on ACP ran a 10-minute sleep with its
+	// native execute tool; the silent command hit the 5-minute stall guard
+	// and was killed with no result. The note must bound native waits.
+	assert.match(ACP_TOOL_NOTE, /Pi Bridge bash tool/);
+	assert.match(ACP_TOOL_NOTE, /five minutes/);
+	assert.match(ACP_TOOL_NOTE, /killed/);
+	assert.match(ACP_TOOL_NOTE, /STILL RUNNING|poll/);
+});
+
+test("codemodeOnly uses cohesive codemode priority note (overrides ACP/shared note)", () => {
+	const out = buildFullPrompt(SYS, "", "hello", { codemodeOnly: true, acpToolsDirect: true });
+	assert.ok(out.includes("[Tool priority (codemode):"));
+	assert.ok(out.includes("stop polling and end your turn"));
+	assert.equal(out.includes(ACP_TOOL_NOTE), false);
+});
+
+test("ACP note gating probes bash activity, not just config (factory level)", async () => {
+	type Probe = boolean | ((name: string) => boolean);
+	const mkHarness = (probe: Probe): Harness => {
+		const seen: { opts?: DriverTurnRequest } = {};
+		const driver: StreamDriver = {
+			run: async (opts: DriverTurnRequest) => {
+				seen.opts = opts;
+				return {
+					id: "fake-turn",
+					outcome: Promise.resolve({
+						status: "OK",
+						response: "ok",
+						finished: true,
+						aborted: false,
+						conversationId: "conv-acp-note",
+					}),
+					next: async () => null,
+					pushExternal: () => {},
+				};
+			},
+		} as unknown as StreamDriver;
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-note-"));
+		const streamSimple = createStreamSimple({
+			entries: [{ id: "gemini-flash", full: "gemini-3.6-flash" }],
+			store: new SessionStore(path.join(dir, "sessions.json")),
+			driver,
+			acpDriver: driver,
+			roundTrips: new ToolRoundTrips(driver),
+			engine: "acp",
+			hasActiveTool:
+				typeof probe === "function"
+					? probe
+					: (name: string) => probe || name !== "bash",
+		});
+		return { seen, streamSimple, dir };
+	};
+	await withEnv({ AGY_SYSTEM_PROMPT: "on", AGY_AGENT: undefined, AGY_BRIDGE_TOOLS: "all" }, async () => {
+		resetSyspromptAgentForTests();
+		const on = mkHarness(true);
+		const off = mkHarness(false);
+		const stale = mkHarness(() => {
+			throw new Error("stale pi handle after /reload");
+		});
+		try {
+			await runTurn(on, "hello", SYS);
+			await runTurn(off, "hello", SYS);
+			// A throwing probe is the stale-handle case (codemodeNote guards the
+			// same throw); the note must fall back to riding, not kill the turn.
+			await runTurn(stale, "hello", SYS);
+			assert.ok(String(on.seen.opts?.prompt).includes(ACP_TOOL_NOTE), "bash active: note rides the inline ACP prompt");
+			assert.equal(String(off.seen.opts?.prompt).includes(ACP_TOOL_NOTE), false, "bash inactive: the note must not advertise tools pi does not have");
+			assert.ok(String(stale.seen.opts?.prompt).includes(ACP_TOOL_NOTE), "throwing probe: note rides via the true fallback and the turn completes");
+			assert.ok(String(on.seen.opts?.prompt).includes(TOOL_PRIORITY_NOTE));
+		} finally {
+			fs.rmSync(on.dir, { recursive: true, force: true });
+			fs.rmSync(off.dir, { recursive: true, force: true });
+			fs.rmSync(stale.dir, { recursive: true, force: true });
+		}
+	});
 });
 
 test("order: system prompt block, then digest, then user prompt", () => {

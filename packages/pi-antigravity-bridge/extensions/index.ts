@@ -45,7 +45,7 @@ import {
 	createStreamSimple,
 	defaultEscalateAfterMs,
 	formatEscalatedAck,
-	formatPollAnswer,
+	answerPoll,
 	rotateSessionOnCompaction,
 	sessionKey,
 	type NativeDisplayEvent,
@@ -55,6 +55,7 @@ import { PollRunFolder, type PollRunData } from "../src/poll-fold.js";
 import {
 	createShadowTool,
 	stripMarkerFields,
+	bashSettingsOptions,
 	type AnyToolDefinition,
 	type GatePolicy,
 } from "../src/approval-gate.js";
@@ -264,11 +265,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const hiddenBridgeTools = new Set<string>();
 	const getBridgeTools = () => {
 		const cfg = loadConfig();
-		return bridgedPiTools(pi.getAllTools(), pi.getActiveTools(), cfg.bridgeTools, hiddenBridgeTools, cfg.codemodeDirectTools);
+		return bridgedPiTools(pi.getAllTools(), pi.getActiveTools(), cfg.bridgeTools, hiddenBridgeTools, engine, cfg.codemodeDirectTools);
 	};
 	// Staged gate hooks do not stop agy's own request_permission path, so when
 	// true the ACP driver stops letting skipPermissions auto-allow it.
 	let gateActive = false;
+	// Set while a required approval gate is not staged; provider turns are
+	// refused until the shadows are registered (fail closed).
+	let gateUnavailable: string | undefined;
 	let managedAcpCleanupRan = false;
 	let legacyConfigCleanupRan = false;
 	let digestMigrationRan = false;
@@ -346,8 +350,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				fileLog.log("stream-home-stage-failed", { error: String(err) }, "warn");
 				// The per-pid --add-dir config is not the stream-json delivery
 				// path; restore the global registration so the bridge stays
-				// reachable when the staged home is unusable.
-				if (mcpHandle) {
+				// reachable when the staged home is unusable. "none" still skips:
+				// no pi tools exposed means nothing to reach.
+				if (mcpHandle && loadConfig().bridgeTools !== "none") {
 					registerBridgeServer({ pid: process.pid, port: mcpHandle.port, token: mcpHandle.realmToken, tokenHeader: TOKEN_HEADER });
 				}
 				return undefined;
@@ -571,21 +576,58 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	// SDK's exact usage metadata before it reaches the client.
 	if (engine === "acp") {
 		let lastUsageStatus = "";
+		// Per-session usage accumulator. Replace-per-message, never sum-per-event:
+		// message_update refires with growing totals while an assistant message
+		// streams, so adding on every event would double-count.
+		const usageByMessage = new Map<number, { input: number; output: number; cacheRead: number }>();
+		let usageTurnStart = { calls: 0, input: 0, output: 0, cacheRead: 0 };
+		const usageSums = () => {
+			let input = 0;
+			let output = 0;
+			let cacheRead = 0;
+			for (const u of usageByMessage.values()) {
+				input += u.input;
+				output += u.output;
+				cacheRead += u.cacheRead;
+			}
+			return { input, output, cacheRead, calls: usageByMessage.size };
+		};
+		pi.on("agent_start", () => {
+			usageTurnStart = usageSums();
+		});
 		pi.on("message_update", (event, ctx) => {
 			if (!ctx.hasUI || event.message.role !== "assistant" || event.message.provider !== "antigravity" || loadConfig().acp.usageEstimate === "off") return;
-			const { input, output } = event.message.usage;
-			const status = ctx.ui.theme.fg("dim", `ACP ≈ ${input} in / ${output} out`);
+			const { input, output, cacheRead } = event.message.usage;
+			// AssistantMessage carries no id; the request-start timestamp is the
+			// per-inference key and is stable across streaming updates.
+			usageByMessage.set(event.message.timestamp, { input, output, cacheRead });
+			const sums = usageSums();
+			const cacheBase = sums.input + sums.cacheRead;
+			const cachePct = cacheBase > 0 ? Math.round((sums.cacheRead / cacheBase) * 100) : 0;
+			const status = ctx.ui.theme.fg("dim", `ACP ≈ ${input} in / ${output} out · cache ${cachePct}% · ${sums.calls} calls`);
 			if (status !== lastUsageStatus) {
 				lastUsageStatus = status;
 				ctx.ui.setStatus("agy-usage", status);
 			}
 		});
 		const clearUsageStatus = (_event: unknown, ctx: { hasUI: boolean; ui: ExtensionUIContext }) => {
+			const sums = usageSums();
+			const turn = {
+				calls: sums.calls - usageTurnStart.calls,
+				input: sums.input - usageTurnStart.input,
+				output: sums.output - usageTurnStart.output,
+				cacheRead: sums.cacheRead - usageTurnStart.cacheRead,
+			};
+			if (turn.calls > 0) {
+				const base = turn.input + turn.cacheRead;
+				fileLog.log("turn-usage", { ...turn, cachePct: base > 0 ? Math.round((turn.cacheRead / base) * 100) : 0 });
+			}
 			lastUsageStatus = "";
 			if (ctx.hasUI) ctx.ui.setStatus("agy-usage", undefined);
 		};
 		pi.on("agent_end", (event, ctx) => {
 			clearUsageStatus(event, ctx);
+			usageByMessage.clear();
 			pendingNativeTools = 0;
 			closePollRun();
 			if (ctx.hasUI) ctx.ui.setStatus("agy-native", undefined);
@@ -792,6 +834,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		onNativeEvent,
 		onNativeBackground: (info) => armConversationWatcher(info.conversationId, info.turnStartMs),
 		roster,
+		gateUnavailable: () => gateUnavailable,
 		pendingCompactionHandoff,
 		hasActiveTool: (name) => pi.getActiveTools().includes(name),
 		engine,
@@ -1110,10 +1153,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		sweepStaleBridgeDirs();
 		sweepStagedAgyHomes();
 		// Start the bridge unless the user turned it off. No patch gate, no
-		// consent flow: calls route through pi's normal toolUse loop.
+		// consent flow: calls route through pi's normal toolUse loop. The
+		// approval gate rides the same listener, so an active gate keeps it
+		// running even with bridgeTools "none" (no pi tools are listed):
+		// hiding pi tools from agy must never un-gate agy's native tools.
 		const bridgeMode: BridgeTools = loadConfig().bridgeTools;
-		if (bridgeMode === "none") return; // user opted out
+		// One resolution per session_start: the staging block below must gate
+		// on the SAME verdict, or a mid-start flip leaves the gate unstaged
+		// while gateUnavailable says pending (every turn refused until restart).
+		const gateMode = resolveGateMode(loadConfig().approvals.gateMode, detectPermissionGateExtensions());
 		if (mcpHandle) return; // already running (reload re-fires session_start)
+		gateUnavailable = gateMode === "off" ? undefined : "approval gate not staged yet";
+		if (bridgeMode === "none" && gateMode === "off") return; // user opted out
 		// pi loads project skill locations only after the project is trusted;
 		// mirror that gate. Global skill dirs are always scanned.
 		const skills: SkillLite[] = scanSkills(ctx.isProjectTrusted() ? { projectDir: process.cwd() } : {});
@@ -1160,7 +1211,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			tools.push({
 				name: POLL_TOOL_NAME,
 				description:
-					"Fetch the result of a long-running bridge tool call that answered STILL RUNNING with a callId. Poll again if it still reports running; the result or an error arrives here.",
+					"Fetch the result of a long-running bridge tool call that answered STILL RUNNING with a callId. The poll blocks up to 110 seconds for the result; call it again immediately if it still reports running.",
 				inputSchema: {
 					type: "object",
 					properties: { callId: { type: "string", description: "callId from the STILL RUNNING answer" } },
@@ -1182,15 +1233,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			if (name === POLL_TOOL_NAME) {
 				const wanted = typeof args.callId === "string" ? args.callId : "";
 				mcpLog("poll-tool", { callId: wanted });
-				const view = roundTrips.poll(wanted);
-				// A terminal answer means the model RECEIVED the result; mark it
-				// so the redelivery path never double-delivers. poll() itself
-				// stays pure (internal peeks must not mark). Accepted gap: the
-				// mark fires when the poll ANSWERS, not when the HTTP response
-				// lands; a drop inside that one-write window would mark a result
-				// the model never saw.
-				if (view && view.state !== "running") roundTrips.markDelivered(wanted);
-				return Promise.resolve(formatPollAnswer(wanted, view));
+				return answerPoll(roundTrips, wanted, signal, mcpLog);
 			}
 			if (name === TOOL_INFO_TOOL_NAME) {
 				const authorized = getBridgeTools();
@@ -1256,7 +1299,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			// stream-json skips the global file entirely when the isolated home
 			// is active (issue #14): this session's bridge rides the staged
 			// config instead, so no other agy on the machine can see or call it.
-			if (engine === "stream-json" && !streamHome.isolated) {
+			// bridgeTools "none" skips it too: with no pi tools exposed, a global
+			// entry would only announce the listener to agy processes the user
+			// opted out of; the gate needs no registration (its hook rides the
+			// session's own add-dir).
+			if (engine === "stream-json" && !streamHome.isolated && bridgeMode !== "none") {
 				if (r.first) {
 					registerBridgeServer({
 						pid: process.pid,
@@ -1288,7 +1335,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			// enabled (auto = on only when a third-party gate extension exists).
 			{
 				const cfg = loadConfig();
-				const mode = resolveGateMode(cfg.approvals.gateMode, detectPermissionGateExtensions());
+				const mode = gateMode;
 				gateActive = mode !== "off";
 				if (mode !== "off" && engine === "acp") {
 					// Staged-home hook delivery is probe-verified on agy 1.5.12
@@ -1348,11 +1395,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 					// pi.getAllTools() is unusable here: it returns ToolInfo, which
 					// strips execute. Marker calls never execute; non-marker calls
 					// delegate to the twins, so behavior matches the standard
-					// builtins (session-level bash-operations overrides are not
-					// inherited; documented in README).
+					// builtins. The shadow replaces bash for EVERY model, so the
+					// twin gets the same shellCommandPrefix/shellPath settings pi
+					// gives its own bash (session-level bash-operations overrides
+					// are still not inherited; documented in README).
 					const gateCwd = process.cwd();
 					const bases: Record<string, AnyToolDefinition> = {
-						bash: createBashToolDefinition(gateCwd) as unknown as AnyToolDefinition,
+						bash: createBashToolDefinition(gateCwd, bashSettingsOptions(pi)) as unknown as AnyToolDefinition,
 						write: createWriteToolDefinition(gateCwd) as unknown as AnyToolDefinition,
 						edit: createEditToolDefinition(gateCwd) as unknown as AnyToolDefinition,
 					};
@@ -1392,9 +1441,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 					// approval toolUse must never dispatch to the REAL builtin and
 					// execute locally.
 					roundTrips.approvalPark = handle.approvals;
+					gateUnavailable = undefined;
 				}
 			}
 		} else {
+			if (gateUnavailable) gateUnavailable = `MCP listener failed: ${r.reason}`;
 			console.error(`[antigravity-bridge] MCP tool bridge disabled: ${r.reason}`);
 		}
 	});
@@ -1990,7 +2041,7 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 						);
 					}
 				} else {
-					ui?.notify(`bridge: ${loadConfig().bridgeTools}\nusage: /agy bridge all|mcp|codemode|none\n  all: active non-builtin pi tools. mcp: active pi-mcp-adapter tools + skills. codemode: the codemode tool + info/call pair only (pi's codemode tool must be active; without it this behaves like all). none: bridge off.`, "info");
+					ui?.notify(`bridge: ${loadConfig().bridgeTools}\nusage: /agy bridge all|mcp|codemode|none\n  all: active non-builtin pi tools (ACP: pi's builtins too, declared directly). mcp: active pi-mcp-adapter tools + skills. codemode: the codemode tool + info/call pair only (pi's codemode tool must be active; without it this behaves like all). none: no pi tools (an active approval gate still runs the listener gate-only).`, "info");
 				}
 				return;
 			}
@@ -2405,7 +2456,7 @@ async function openAgyPicker(ui: ExtensionUIContext, ctx: AgyCommandCtx): Promis
 			id: "bridge",
 			label: "Bridge tools",
 			description:
-				"Which pi tools the MCP bridge exposes to agy. all: every non-builtin tool (default). mcp: pi-mcp-adapter tools + skills. codemode: the codemode tool + info/call pair only (pi's codemode tool must be active, e.g. --tools codemode). none: bridge off.",
+				"Which pi tools the MCP bridge exposes to agy. all (default): every non-builtin tool; on ACP also pi's builtins (read, ls, grep, find, edit, write, bash), declared directly so long commands ride the poll machinery. mcp: pi-mcp-adapter tools + skills. codemode: the codemode tool + info/call pair only (pi's codemode tool must be active, e.g. --tools codemode). none: no pi tools (an active approval gate still runs the listener gate-only).",
 			currentValue: config.bridgeTools,
 			values: ["all", "mcp", "codemode", "none"],
 		},
